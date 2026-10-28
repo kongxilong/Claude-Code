@@ -1,3 +1,79 @@
+/**
+ * 【一句话定位】Agent 工具的定义文件：主 Agent（main REPL）通过调用它来派生子 Agent（subagent）、
+ * fork worker 或 teammate，等子 Agent 跑完后把它的最终回复包装成 tool_result 回传给主 Agent。
+ *
+ * 【在架构中的位置】
+ *   上游调用链：
+ *     query.ts（主循环）→ services/tools/toolOrchestration.ts（并发跑工具）
+ *       → Tool.call() → 本文件的 AgentTool.call()
+ *   下游调用链：
+ *     call() → prompt.ts(getPrompt 生成工具描述)
+ *            → forkSubagent.ts(buildForkedMessages 造 fork 上下文 / isForkSubagentEnabled 开关)
+ *            → spawnMultiAgent.ts(spawnTeammate，起一个独立进程的 teammate)
+ *            → runAgent.ts(runAgent，真正开一个 query 循环跑子 Agent)
+ *            → agentToolUtils.ts(finalizeAgentTool 收敛结果 / runAsyncAgentLifecycle 后台生命周期)
+ *            → tasks/LocalAgentTask/LocalAgentTask.ts(注册/完成/失败/通知后台任务)
+ *            → UI.tsx(终端里怎么渲染这个工具)
+ *   一句话：本文件是「总调度台」，自己不跑模型，只负责决定跑谁、怎么跑、结果怎么回传。
+ *
+ * 【本文件包含什么】
+ *   - PROGRESS_THRESHOLD_MS / isBackgroundTasksDisabled / getAutoBackgroundMs()：后台化相关的常量与开关。
+ *   - baseInputSchema / fullInputSchema / inputSchema：zod 输入校验 schema，按 feature 开关裁剪字段。
+ *   - outputSchema / Output / TeammateSpawnedOutput / RemoteLaunchedOutput / InternalOutput：输出类型。
+ *   - AgentToolInput：显式放宽后的入参类型（schema 裁掉的字段在类型里仍在）。
+ *   - AgentTool：buildTool() 构造出的工具对象，含 prompt/description/call/checkPermissions/
+ *     mapToolResultToToolResultBlockParam 等回调。
+ *   - call()：最核心的函数，占本文件 ~1000 行，负责「选 agent → 校验 → 配上下文 → 起跑 → 收敛结果」。
+ *   - resolveTeamName()：从入参或当前 team 上下文里解析出团队名。
+ *
+ * 【子 Agent 机制要点】(Java 工程师视角)
+ *   - 主 Agent 与子 Agent：两者都是同一套 query 循环，区别在 ToolUseContext。子 Agent 拿到的是
+ *     createSubagentContext() 派生出来的「子上下文」：自己的 agentId、被裁剪过的工具池、自己的
+ *     system prompt。主 Agent 只是把子 Agent 的最后一条 assistant 文本当作一个普通 tool_result 收到。
+ *   - fork 子 Agent：见 forkSubagent.ts。fork 走 useExactTools=true，直接复用父级完整的 system prompt +
+ *     完整工具数组 + 父级对话消息，目的是让 API 请求前缀字节级一致从而命中 prompt cache；
+ *     而普通 subagent 是「零上下文起步」，只带一条 user message。
+ *   - 工具裁剪：workerTools = assembleToolPool(自己的 permissionMode)，再经 agentToolUtils.ts 的
+ *     resolveAgentTools() 按 ALL_AGENT_DISALLOWED_TOOLS / CUSTOM_AGENT_DISALLOWED_TOOLS /
+ *     ASYNC_AGENT_ALLOWED_TOOLS 三张表过滤（比如子 Agent 默认不能再起子 Agent）。
+ *   - 结果回传：sync 走 finalizeAgentTool() 收敛成 content+usage 直接 return；
+ *     async 走 runAsyncAgentLifecycle()，完成后通过 enqueueAgentNotification() 以 <task-notification>
+ *     形式插回主 Agent 的下一轮对话。
+ *   - resumeAgent：靠 recordSidechainTranscript() 把每条消息落到磁盘（sidechain transcript），
+ *     resumeAgent.ts 再读回来拼上新的 user message 继续跑，agentId 保持一致。
+ *
+ * 【TS 语法速查】(针对本文件实际出现的语法)
+ *   - `import type { X } from '...'`：只导入类型，编译后整行消失（≈ Java 里只 import 一个接口的签名）。
+ *   - 类型标注写在变量名**后面**：`let x: string | undefined`，Java 是写在前面，最容易看串。
+ *   - `A | B` 联合类型 ≈ Java sealed interface 的两个实现；`A & B` 交叉类型 ≈ 同时 implements 两个接口。
+ *   - `?.` 可选链 ≈ null 检查短路：`a?.b?.c`，a 为 null/undefined 时整体得 undefined 而不抛 NPE。
+ *   - `??` 空值合并：只在 null/undefined 时取右边。注意与 `||` 区别：`0`、`''`、`false` 会被 `||` 替换，
+ *     但不会被 `??` 替换。本文件大量用 `??` 正是为了保住 false/0。
+ *   - `!` 非空断言（后缀）：`x!` ≈ 强制类型转换，告诉编译器「我保证非空」，运行时不做任何检查。
+ *   - `as X` / `as unknown as X` ≈ 强制转换；`as unknown as` 是「先转成 unknown 再转成 X」，
+ *     用来绕过 TS 认为不可能的转换（本文件用它绕过 Output 联合类型的收窄）。
+ *   - `as const` 字面量断言：`'completed' as const` 把类型锁成字面量 'completed' 而不是 string，
+ *     是 discriminated union（可辨识联合）能收窄的前提。
+ *   - `x is T` 类型谓词返回类型 ≈ Java 的 instanceof 模式匹配：调用后 TS 自动把 x 收窄成 T。
+ *   - `{ ...obj, k: v }` 展开语法 = 不可变更新（复制一份再覆盖字段），≈ Java 里 new 一个 Builder 再 build()。
+ *   - `z.object({...})` / `.describe(...)`：zod 库的运行时校验器，同时给出 JSON Schema 给模型看。
+ *   - `lazySchema(() => ...)`：延迟构造 schema（避免模块加载时就递归依赖）。
+ *   - `feature('X')`：来自 'bun:bundle' 的**编译期**宏，≈ C 的 #ifdef，构建时就把 false 分支整段删掉，
+ *     不是运行时 if。所以 `if ('external' === 'ant' && ...)` 这种恒假条件是为了 dead code elimination。
+ *   - `async function*`(runAgent.ts) + `yield` + `for await` ≈ Java Reactor 的 Flux：
+ *     `for await (const m of it)` 就是逐个消费异步产生的元素。
+ *   - `[Symbol.asyncIterator]()`：显式拿到异步迭代器对象，才能手写 `while(true) { it.next() }` 循环。
+ *   - 解构赋值 `const { a, b } = obj` ≈ 一次取多个字段；参数位置解构 `async call({ prompt, ... }, ctx)`
+ *     表示第一个入参是对象，直接拆开用。
+ *   - `onProgress?` 参数名后的 `?` = 可选参数；`type X = { a?: string }` 里的 `?` = 可选属性。
+ *   - `<T,>(fn: () => T): T` 泛型箭头函数：`.tsx` 文件里 `<T>` 会和 JSX 标签冲突，所以写成 `<T,>`。
+ *   - `void promise` ≈ 「我故意不 await」，用于 fire-and-forget；`.catch()` 防止 unhandled rejection。
+ *   - .tsx 文件里的 `<BackgroundHint />` 是 JSX：看起来像 XML 标签，实际会被编译成 React 组件树，
+ *     ≈ Java 的 StringTemplate，但产出的是组件树而非字符串。
+ *   - `satisfies ToolDef<...>`：`satisfies` 检查类型是否满足条件但**不改变**推导出的字面量类型，
+ *     比 `as` 更安全（保留精确类型）。
+ *   - `data satisfies never`：穷尽性检查——走到这里说明前面分支已穷尽所有可能，否则编译报错。
+ */
 import { feature } from 'bun:bundle';
 import * as React from 'react';
 import { buildTool, type ToolDef, toolMatchesName } from 'src/Tool.js';
@@ -56,19 +132,35 @@ import { runAgent } from './runAgent.js';
 import { renderGroupedAgentToolUse, renderToolResultMessage, renderToolUseErrorMessage, renderToolUseMessage, renderToolUseProgressMessage, renderToolUseRejectedMessage, renderToolUseTag, userFacingName, userFacingNameBackgroundColor } from './UI.js';
 
 /* eslint-disable @typescript-eslint/no-require-imports */
+/**
+ * PROACTIVE / KAIROS 两个实验模块的条件加载。
+ * `require(...)` 放在 feature() 判断里是刻意的：feature() 是编译期宏，为 false 时
+ * 整个 require 连带着这段代码会被打包器删掉，模块根本不会被打进产物（dead code elimination）。
+ */
 const proactiveModule = feature('PROACTIVE') || feature('KAIROS') ? require('../../proactive/index.js') as typeof import('../../proactive/index.js') : null;
 /* eslint-enable @typescript-eslint/no-require-imports */
 
 // Progress display constants (for showing background hint)
+// 子 Agent 跑超过 2 秒还没结束，就在终端提示「可以用 ↓ 管理 / ctrl+o 展开」，避免用户以为卡死
 const PROGRESS_THRESHOLD_MS = 2000; // Show background hint after 2 seconds
 
 // Check if background tasks are disabled at module load time
+// 后台任务总开关。必须在**模块加载时**就定下来，因为 inputSchema 是在模块级构造的，
+// 而这个开关决定 schema 里要不要保留 run_in_background 字段。
 const isBackgroundTasksDisabled =
 // eslint-disable-next-line custom-rules/no-process-env-top-level -- Intentional: schema must be defined at module load
 isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS);
 
 // Auto-background agent tasks after this many ms (0 = disabled)
 // Enabled by env var OR GrowthBook gate (checked lazily since GB may not be ready at module load)
+/**
+ * 返回「同步子 Agent 跑多久后自动转后台」的毫秒数，0 表示不自动转。
+ * 为什么需要：同步子 Agent 会一直占着主循环的这一轮，如果它跑很久，用户既不能输入
+ * 也看不到进度。超过阈值就把它挪到后台，主 Agent 立刻拿到 async_launched 结果继续干活。
+ * 注意：这里**不能**在模块加载时就读 GrowthBook（那时 gate 可能还没就绪），所以是
+ * 每次调用时懒读取，且用的是 _CACHED_MAY_BE_STALE（允许读到稍旧的缓存值）。
+ * @returns 毫秒数；120_000 是下划线数字分隔符，= 120000（Java 7+ 也支持这个写法）
+ */
 function getAutoBackgroundMs(): number {
   if (isEnvTruthy(process.env.CLAUDE_AUTO_BACKGROUND_TASKS) || getFeatureValue_CACHED_MAY_BE_STALE('tengu_auto_background_agents', false)) {
     return 120_000;
@@ -79,6 +171,11 @@ function getAutoBackgroundMs(): number {
 // Multi-agent type constants are defined inline inside gated blocks to enable dead code elimination
 
 // Base input schema without multi-agent parameters
+/**
+ * 不含多 Agent 参数的基础输入 schema。
+ * 用 lazySchema 包一层而不是直接 z.object，是为了把 schema 的构造推迟到真正用到的时刻，
+ * 避开模块加载期的循环依赖（AgentTool ↔ tools.ts）。
+ */
 const baseInputSchema = lazySchema(() => z.object({
   description: z.string().describe('A short (3-5 word) description of the task'),
   prompt: z.string().describe('The task for the agent to perform'),
@@ -88,6 +185,11 @@ const baseInputSchema = lazySchema(() => z.object({
 }));
 
 // Full schema combining base + multi-agent params + isolation
+/**
+ * 完整输入 schema = 基础参数 + 多 Agent 参数（name/team_name/mode）+ 隔离参数（isolation/cwd）。
+ * 里面用 `("external" === 'ant' ? A : B)` 这种恒假三元是有意写的：'external' 和 'ant' 都是
+ * 编译期常量，构建时就会被替换并折叠，从而把 ant 内部专用的 remote 隔离整段消掉。
+ */
 const fullInputSchema = lazySchema(() => {
   // Multi-agent parameters
   const multiAgentInputSchema = z.object({
@@ -107,6 +209,14 @@ const fullInputSchema = lazySchema(() => {
 // (field type collapses to `unknown`). The ternary return produces a union
 // type, but call() destructures via the explicit AgentToolInput type below
 // which always includes all optional fields.
+/**
+ * 最终暴露给模型的输入 schema。
+ * 关键点：当某个 feature 关闭时，用 .omit() 把对应字段从 schema 里**删掉**，让模型压根看不到
+ * 这个参数（而不是给了参数再拒绝）。
+ * 为什么用 .omit() 而不是在 .extend() 里写条件展开？因为展开三元会让 zod 的类型推导崩掉，
+ * 字段类型退化成 unknown。代价是 schema 的推导类型会少字段，所以下面又用 AgentToolInput
+ * 这个显式类型把字段补回来。
+ */
 export const inputSchema = lazySchema(() => {
   const schema = feature('KAIROS') ? fullInputSchema() : fullInputSchema().omit({
     cwd: true
@@ -129,6 +239,9 @@ type InputSchema = ReturnType<typeof inputSchema>;
 // fields even when .omit() strips them for gating (cwd, run_in_background).
 // subagent_type is optional; call() defaults it to general-purpose when the
 // fork gate is off, or routes to the fork path when the gate is on.
+// 显式类型：把 schema 推导「放宽」到始终包含全部可选字段。
+// 因为上面 .omit() 只为「藏参数」服务，而 call() 内部一律按「字段都在」来写，
+// 若直接用 schema 推导出的类型，访问被裁掉的字段会编译报错。
 type AgentToolInput = z.infer<ReturnType<typeof baseInputSchema>> & {
   name?: string;
   team_name?: string;
@@ -138,6 +251,12 @@ type AgentToolInput = z.infer<ReturnType<typeof baseInputSchema>> & {
 };
 
 // Output schema - multi-agent spawned schema added dynamically at runtime when enabled
+/**
+ * 输出 schema，是一个「可辨识联合」(discriminated union)：
+ *   - syncOutputSchema：status='completed'，同步跑完，直接带 content + usage
+ *   - asyncOutputSchema：status='async_launched'，只回一个 agentId + 输出文件路径，之后靠通知回来
+ * 之所以分成两种，是因为同步和异步回传给主 Agent 的信息完全不一样。
+ */
 export const outputSchema = lazySchema(() => {
   const syncOutputSchema = agentToolResultSchema().extend({
     status: z.literal('completed'),
@@ -158,6 +277,8 @@ type Output = z.input<OutputSchema>;
 
 // Private type for teammate spawn results - excluded from exported schema for dead code elimination
 // The 'teammate_spawned' status string is only included when ENABLE_AGENT_SWARMS is true
+// teammate spawn 的结果类型。刻意**不**放进导出的 outputSchema：
+// 这样打包时整个 teammate 分支能被 dead code elimination 掉。
 type TeammateSpawnedOutput = {
   status: 'teammate_spawned';
   prompt: string;
@@ -180,6 +301,11 @@ type TeammateSpawnedOutput = {
 // Private type for remote-launched results — excluded from exported schema
 // like TeammateSpawnedOutput for dead code elimination purposes. Exported
 // for UI.tsx to do proper discriminated-union narrowing instead of ad-hoc casts.
+/**
+ * 远程（CCR）启动的结果类型。和 TeammateSpawnedOutput 一样，刻意不放进导出的 outputSchema，
+ * 以便整块代码在非 ant 构建里被消掉。导出是为了让 UI.tsx 能做正规的联合类型收窄，
+ * 而不是到处写 `as any`。
+ */
 export type RemoteLaunchedOutput = {
   status: 'remote_launched';
   taskId: string;
@@ -193,6 +319,16 @@ import type { AgentToolProgress, ShellProgress } from '../../types/tools.js';
 // AgentTool forwards both its own progress events and shell progress
 // events from the sub-agent so the SDK receives tool_progress updates during bash/powershell runs.
 export type Progress = AgentToolProgress | ShellProgress;
+/**
+ * Agent 工具本体。buildTool() 是工具工厂：传入一组回调，返回符合 ToolDef 的工具对象。
+ * 各个回调的分工（按被调用的时机排序）：
+ *   ① prompt()      —— 生成给模型看的工具描述（可用 agent 列表）
+ *   ② inputSchema   —— 给模型看的入参 JSON Schema，同时用于运行时校验
+ *   ③ checkPermissions() —— 要不要弹权限框（这里几乎一律放行）
+ *   ④ call()        —— 真正执行，本文件的主体
+ *   ⑤ mapToolResultToToolResultBlockParam() —— 把 call() 的返回值翻译成发给模型的 tool_result 文本
+ *   ⑥ render*()     —— 终端 UI 渲染（委托给 UI.tsx）
+ */
 export const AgentTool = buildTool({
   async prompt({
     agents,
@@ -236,6 +372,27 @@ export const AgentTool = buildTool({
   get outputSchema(): OutputSchema {
     return outputSchema();
   },
+/**
+ * Agent 工具的执行主体。整体流程（对应下面 ①~⑧）：
+ *   ① 权限/团队前置校验：agent teams 是否可用、teammate 能不能再生 teammate、
+ *      in-process teammate 能不能起后台 agent
+ *   ② 分流：带 name+team_name → spawnTeammate（起独立进程 teammate）；
+ *      否则 → 选一个 AgentDefinition（省略 subagent_type 且 fork 开关开着 → FORK_AGENT）
+ *   ③ 校验 selectedAgent 依赖的 MCP server 是否已连上（必要时轮询等待最多 30 秒）
+ *   ④ 构造 system prompt + 初始消息：fork 路径复用父级 system prompt 并克隆父级完整对话；
+ *      普通路径用该 agent 自己的 system prompt + 一条 user message
+ *   ⑤ 决定同步还是异步（run_in_background / agent 定义 / coordinator / fork / 助手模式）
+ *   ⑥ 组装子 Agent 的工具池 workerTools（按子 Agent 自己的 permissionMode，不受父级限制）
+ *   ⑦ 异步：注册后台任务后 fire-and-forget 跑 runAsyncAgentLifecycle，立刻返回 async_launched；
+ *      同步：边迭代边转发进度，跑完用 finalizeAgentTool 收敛成 completed 结果
+ *   ⑧ 结果经 mapToolResultToToolResultBlockParam 变成 tool_result 文本回到主 Agent
+ *
+ * @param input 已通过 zod 校验的入参（prompt/subagent_type/description/model/...）
+ * @param toolUseContext 当前主 Agent 的上下文（appState、abortController、messages 等）
+ * @param canUseTool 权限判定函数，往下传给子 Agent 的 query 循环
+ * @param assistantMessage 触发这次调用的那条 assistant 消息（含 tool_use 块），fork 需要它
+ * @param onProgress 进度回调，用于把子 Agent 的 tool_use/tool_result 转发给上层（SDK/UI）
+ */
   async call({
     prompt,
     subagent_type,
@@ -248,7 +405,10 @@ export const AgentTool = buildTool({
     isolation,
     cwd
   }: AgentToolInput, toolUseContext, canUseTool, assistantMessage, onProgress?) {
+// 记录起始时间，用于最后统计 durationMs（子 Agent 耗时）
     const startTime = Date.now();
+// coordinator 模式下忽略调用方传的 model：coordinator 自己统一决定 worker 用什么模型，
+// 否则各个 worker 用不同模型会打散 prompt cache。
     const model = isCoordinatorMode() ? undefined : modelParam;
 
     // Get app state for permission mode and agent filtering
@@ -259,6 +419,7 @@ export const AgentTool = buildTool({
     const rootSetAppState = toolUseContext.setAppStateForTasks ?? toolUseContext.setAppState;
 
     // Check if user is trying to use agent teams without access
+// agent teams 是付费/白名单能力，没开通就直接抛错，而不是默默降级成 subagent
     if (team_name && !isAgentSwarmsEnabled()) {
       throw new Error('Agent Teams is not yet available on your plan.');
     }
@@ -266,6 +427,8 @@ export const AgentTool = buildTool({
     // Teammates (in-process or tmux) passing `name` would trigger spawnTeammate()
     // below, but TeamFile.members is a flat array with one leadAgentId — nested
     // teammates land in the roster with no provenance and confuse the lead.
+// 坑：teammate 再 spawn teammate 是不允许的。因为 TeamFile.members 是一个扁平数组，
+// 只有一个 leadAgentId，嵌套出来的 teammate 在名单里没有任何来源标记，lead 会认不出来。
     const teamName = resolveTeamName({
       team_name
     }, appState);
@@ -275,18 +438,23 @@ export const AgentTool = buildTool({
     // In-process teammates cannot spawn background agents (their lifecycle is
     // tied to the leader's process). Tmux teammates are separate processes and
     // can manage their own background agents.
+// in-process teammate 的生命周期绑在 leader 进程上（同一个 Node 进程 + AsyncLocalStorage），
+// 它没有独立的「后台」概念，所以禁止起后台 agent。tmux teammate 是独立进程，不受此限。
     if (isInProcessTeammate() && teamName && run_in_background === true) {
       throw new Error('In-process teammates cannot spawn background agents. Use run_in_background=false for synchronous subagents.');
     }
 
     // Check if this is a multi-agent spawn request
     // Spawn is triggered when team_name is set (from param or context) and name is provided
+// ===== 分支 A：起一个 teammate（独立进程 / 独立 pane），本函数到这里就 return 了 =====
     if (teamName && name) {
       // Set agent definition color for grouped UI display before spawning
       const agentDef = subagent_type ? toolUseContext.options.agentDefinitions.activeAgents.find(a => a.agentType === subagent_type) : undefined;
       if (agentDef?.color) {
         setAgentColor(subagent_type!, agentDef.color);
       }
+// spawnTeammate 会把一个全新的 Claude Code 进程塞进 tmux pane（或 in-process 跑起来），
+// 本进程不参与它的执行，只把启动结果带回去。
       const result = await spawnTeammate({
         name,
         prompt,
@@ -319,9 +487,14 @@ export const AgentTool = buildTool({
     // - subagent_type set: use it (explicit wins)
     // - subagent_type omitted, gate on: fork path (undefined)
     // - subagent_type omitted, gate off: default general-purpose
+// 决定最终走哪个 agent：
+//   - 显式传了 subagent_type → 用它（显式优先）
+//   - 没传 + fork 开关开 → undefined，走 fork 分支
+//   - 没传 + fork 开关关 → 退化成 general-purpose（历史行为兼容）
     const effectiveType = subagent_type ?? (isForkSubagentEnabled() ? undefined : GENERAL_PURPOSE_AGENT.agentType);
     const isForkPath = effectiveType === undefined;
     let selectedAgent: AgentDefinition;
+// ===== 分支 B1：fork 路径。子 Agent 完整继承父 Agent 的上下文 =====
     if (isForkPath) {
       // Recursive fork guard: fork children keep the Agent tool in their
       // pool for cache-identical tool defs, so reject fork attempts at call
@@ -329,11 +502,17 @@ export const AgentTool = buildTool({
       // context.options at spawn time, survives autocompact's message
       // rewrite). Message-scan fallback catches any path where querySource
       // wasn't threaded.
+// 防递归 fork：fork 出来的孩子为了保持工具定义字节级一致，工具池里**仍然保留** Agent 工具，
+// 所以只能在运行时（call 里）拦。
+// 主判据用 querySource 而不是扫消息，因为 querySource 写在 context.options 上，
+// autocompact 只重写 messages、不动 options，所以不会被压缩掉；扫消息只是兜底。
       if (toolUseContext.options.querySource === `agent:builtin:${FORK_AGENT.agentType}` || isInForkChild(toolUseContext.messages)) {
         throw new Error('Fork is not available inside a forked worker. Complete your task directly using your tools.');
       }
       selectedAgent = FORK_AGENT;
     } else {
+// ===== 分支 B2：普通 subagent。从已注册的 agent 定义里找一个 =====
+// 先按权限规则过滤掉被 Agent(X) deny 的类型，再按 allowedAgentTypes（来自 Agent(x,y) 语法）收窄。
       // Filter agents to exclude those denied via Agent(AgentName) syntax
       const allAgents = toolUseContext.options.agentDefinitions.activeAgents;
       const {
@@ -343,6 +522,7 @@ export const AgentTool = buildTool({
       // When allowedAgentTypes is set (from Agent(x,y) tool spec), restrict to those types
       allowedAgentTypes ? allAgents.filter(a => allowedAgentTypes.includes(a.agentType)) : allAgents, appState.toolPermissionContext, AGENT_TOOL_NAME);
       const found = agents.find(agent => agent.agentType === effectiveType);
+// 找不到时区分两种错误：被权限规则 deny（提示规则来源，方便用户改 settings）vs 压根不存在
       if (!found) {
         // Check if the agent exists but is denied by permission rules
         const agentExistsButDenied = allAgents.find(agent => agent.agentType === effectiveType);
@@ -358,20 +538,28 @@ export const AgentTool = buildTool({
     // Same lifecycle constraint as the run_in_background guard above, but for
     // agent definitions that force background via `background: true`. Checked
     // here because selectedAgent is only now resolved.
+// 和上面 run_in_background 的校验同一条约束，但要等 selectedAgent 解析出来才能判断
+// —— 有些 agent 定义里写了 `background: true`，等于强制后台。
     if (isInProcessTeammate() && teamName && selectedAgent.background === true) {
       throw new Error(`In-process teammates cannot spawn background agents. Agent '${selectedAgent.agentType}' has background: true in its definition.`);
     }
 
     // Capture for type narrowing — `let selectedAgent` prevents TS from
     // narrowing property types across the if-else assignment above.
+// const 中转一下是为了让 TS 能收窄类型：selectedAgent 是 let，跨 if/else 赋值后
+// TS 不会保留属性级别的类型收窄。
     const requiredMcpServers = selectedAgent.requiredMcpServers;
 
     // Check if required MCP servers have tools available
     // A server that's connected but not authenticated won't have any tools
+// agent 的 frontmatter 可以声明 requiredMcpServers。注意判据是「有没有拿到工具」，
+// 而不是「有没有连上」——连上了但没鉴权的 server 是没有工具的，照样算不满足。
     if (requiredMcpServers?.length) {
       // If any required servers are still pending (connecting), wait for them
       // before checking tool availability. This avoids a race condition where
       // the agent is invoked before MCP servers finish connecting.
+// 竞态处理：MCP client 可能是异步连接的，agent 被调起时它们还在 pending。
+// 这里先等它们连完再判断，否则会误报「缺少 MCP server」。
       const hasPendingRequiredServers = appState.mcp.clients.some(c => c.type === 'pending' && requiredMcpServers.some(pattern => c.name.toLowerCase().includes(pattern.toLowerCase())));
       let currentAppState = appState;
       if (hasPendingRequiredServers) {
@@ -384,6 +572,8 @@ export const AgentTool = buildTool({
 
           // Early exit: if any required server has already failed, no point
           // waiting for other pending servers — the check will fail regardless.
+// 提前退出：只要有一个必需 server 已经 failed，就没必要再等其它 pending 的了，
+// 结果注定失败。
           const hasFailedRequiredServer = currentAppState.mcp.clients.some(c => c.type === 'failed' && requiredMcpServers.some(pattern => c.name.toLowerCase().includes(pattern.toLowerCase())));
           if (hasFailedRequiredServer) break;
           const stillPending = currentAppState.mcp.clients.some(c => c.type === 'pending' && requiredMcpServers.some(pattern => c.name.toLowerCase().includes(pattern.toLowerCase())));
@@ -410,11 +600,13 @@ export const AgentTool = buildTool({
     }
 
     // Initialize the color for this agent if it has a predefined one
+// agent 定义里可以写 color，注册到全局颜色表，让 UI 里同类 agent 显示同一个颜色
     if (selectedAgent.color) {
       setAgentColor(selectedAgent.agentType, selectedAgent.color);
     }
 
     // Resolve agent params for logging (these are already resolved in runAgent)
+// 解析最终模型优先级：agent 定义 > 调用方显式传的 model > 主循环模型 > permissionMode 相关默认
     const resolvedAgentModel = getAgentModel(selectedAgent.model, toolUseContext.options.mainLoopModel, isForkPath ? undefined : model, permissionMode);
     logEvent('tengu_agent_tool_selected', {
       agent_type: selectedAgent.agentType as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -428,10 +620,13 @@ export const AgentTool = buildTool({
     });
 
     // Resolve effective isolation mode (explicit param overrides agent def)
+// 隔离模式：显式入参覆盖 agent 定义里的 isolation
     const effectiveIsolation = isolation ?? selectedAgent.isolation;
 
     // Remote isolation: delegate to CCR. Gated ant-only — the guard enables
     // dead code elimination of the entire block for external builds.
+// ===== 分支 C：remote 隔离（ant 内部专用，整块会被 dead code elimination）=====
+// 把整段执行搬到远端 CCR 环境，本地只注册一个远程任务等通知。
     if ("external" === 'ant' && effectiveIsolation === 'remote') {
       const eligibility = await checkRemoteAgentEligibility();
       if (!eligibility.eligible) {
@@ -489,15 +684,22 @@ export const AgentTool = buildTool({
     //
     // Normal path: build the selected agent's own system prompt with env
     // details, and use a simple user message for the prompt.
+// ===== 构造 system prompt 和初始消息，两条路径完全不同 =====
+// fork 路径：用**父级的** system prompt（不是 FORK_AGENT 自己的），为了让 API 请求前缀
+//          字节一致从而命中 prompt cache；消息用 buildForkedMessages() 克隆父级完整对话。
+// 普通路径：用该 agent 自己的 system prompt，配一条简单的 user message（零上下文起步）。
     let enhancedSystemPrompt: string[] | undefined;
     let forkParentSystemPrompt: ReturnType<typeof buildEffectiveSystemPrompt> | undefined;
     let promptMessages: MessageType[];
     if (isForkPath) {
+// 优先用父级已经渲染好的 system prompt 字节（threaded 过来），这是最准的。
       if (toolUseContext.renderedSystemPrompt) {
         forkParentSystemPrompt = toolUseContext.renderedSystemPrompt;
       } else {
         // Fallback: recompute. May diverge from parent's cached bytes if
         // GrowthBook state changed between parent turn-start and fork spawn.
+// 兜底：重新算一遍。可能和父级实际发出的字节有偏差（GrowthBook 状态在父级 turn 开始时
+// 到 fork 派生之间变了），但总比没有强。
         const mainThreadAgentDefinition = appState.agent ? appState.agentDefinitions.activeAgents.find(a => a.agentType === appState.agent) : undefined;
         const additionalWorkingDirectories = Array.from(appState.toolPermissionContext.additionalWorkingDirectories.keys());
         const defaultSystemPrompt = await getSystemPrompt(toolUseContext.options.tools, toolUseContext.options.mainLoopModel, additionalWorkingDirectories, toolUseContext.options.mcpClients);
@@ -509,6 +711,7 @@ export const AgentTool = buildTool({
           appendSystemPrompt: toolUseContext.options.appendSystemPrompt
         });
       }
+// 克隆父级的最后一条 assistant 消息（含所有 tool_use）+ 占位 tool_result + 本 fork 的指令
       promptMessages = buildForkedMessages(prompt, assistantMessage);
     } else {
       try {
@@ -531,14 +734,17 @@ export const AgentTool = buildTool({
         }
 
         // Apply environment details enhancement
+// enhanceSystemPromptWithEnvDetails 负责把 cwd、平台、目录结构等环境信息追加到 system prompt
         enhancedSystemPrompt = await enhanceSystemPromptWithEnvDetails([agentPrompt], resolvedAgentModel, additionalWorkingDirectories);
       } catch (error) {
         logForDebugging(`Failed to get system prompt for agent ${selectedAgent.agentType}: ${errorMessage(error)}`);
       }
+// 普通 subagent：只有一条 user message，它**看不到**主 Agent 之前的任何对话
       promptMessages = [createUserMessage({
         content: prompt
       })];
     }
+// metadata 贯穿整个生命周期：finalizeAgentTool 用它算耗时、埋点，resume 也靠它还原描述
     const metadata = {
       prompt,
       resolvedAgentModel,
@@ -554,6 +760,8 @@ export const AgentTool = buildTool({
 
     // Fork subagent experiment: force ALL spawns async for a unified
     // <task-notification> interaction model (not just fork spawns — all of them).
+// fork 实验下**所有** spawn 都强制异步，好让交互模型统一成 <task-notification>：
+// 主 Agent 立刻拿回控制权，子 Agent 完成后以通知形式插回来。
     const forceAsync = isForkSubagentEnabled();
 
     // Assistant mode: force all agents async. Synchronous subagents hold the
@@ -563,13 +771,21 @@ export const AgentTool = buildTool({
     // executeForkedSlashCommand's fire-and-forget path; the
     // <task-notification> re-entry there is handled by the else branch
     // below (registerAsyncAgentTask + notifyOnCompletion).
+// 助手模式（KAIROS）也强制异步。原因很实际：同步子 Agent 会把主循环这一轮卡住，
+// daemon 的 inputQueue 会积压，一次 cron 补跑就变成 N 个串行的子 Agent turn，用户输入全被堵死。
     const assistantForceAsync = feature('KAIROS') ? appState.kairosEnabled : false;
+// 最终判定：入参 / agent 定义 / coordinator / fork / 助手模式 / proactive，任一为真即异步；
+// 但后台任务总开关打开时一律同步（!isBackgroundTasksDisabled 这个 && 是最后一道闸）。
     const shouldRunAsync = (run_in_background === true || selectedAgent.background === true || isCoordinator || forceAsync || assistantForceAsync || (proactiveModule?.isProactiveActive() ?? false)) && !isBackgroundTasksDisabled;
     // Assemble the worker's tool pool independently of the parent's.
     // Workers always get their tools from assembleToolPool with their own
     // permission mode, so they aren't affected by the parent's tool
     // restrictions. This is computed here so that runAgent doesn't need to
     // import from tools.ts (which would create a circular dependency).
+// ===== 子 Agent 的工具池裁剪 ===== 为什么这里算而不是放在 runAgent.ts？
+// 因为 runAgent.ts 若 import tools.ts 会形成循环依赖，所以由调用方（本文件）算好传进去。
+// 关键：worker 用自己的 permissionMode（默认 acceptEdits）**独立**组装工具池，
+// 因此不受父级工具限制的影响——父级被禁的工具不代表子 Agent 也被禁。
     const workerPermissionContext = {
       ...appState.toolPermissionContext,
       mode: selectedAgent.permissionMode ?? 'acceptEdits'
@@ -577,6 +793,7 @@ export const AgentTool = buildTool({
     const workerTools = assembleToolPool(workerPermissionContext, appState.mcp.tools);
 
     // Create a stable agent ID early so it can be used for worktree slug
+// 提前生成 agentId，因为 worktree 的目录名要用它的前 8 位做 slug
     const earlyAgentId = createAgentId();
 
     // Set up worktree isolation if requested
@@ -587,6 +804,7 @@ export const AgentTool = buildTool({
       gitRoot?: string;
       hookBased?: boolean;
     } | null = null;
+// isolation: 'worktree' —— 给子 Agent 开一个独立的 git worktree，让它改文件不影响主仓库
     if (effectiveIsolation === 'worktree') {
       const slug = `agent-${earlyAgentId.slice(0, 8)}`;
       worktreeInfo = await createAgentWorktree(slug);
@@ -595,17 +813,22 @@ export const AgentTool = buildTool({
     // Fork + worktree: inject a notice telling the child to translate paths
     // and re-read potentially stale files. Appended after the fork directive
     // so it appears as the most recent guidance the child sees.
+// fork + worktree 组合时额外插一条提示：告知孩子「继承来的路径是父级的，要自己翻译，
+// 且改之前重新读一遍文件」。放在 fork 指令之后，作为它看到的最后一条指引。
     if (isForkPath && worktreeInfo) {
       promptMessages.push(createUserMessage({
         content: buildWorktreeNotice(getCwd(), worktreeInfo.worktreePath)
       }));
     }
+// 交给 runAgent 的参数包。`Parameters<typeof runAgent>[0]` 是「取 runAgent 第一个参数的类型」，
+// ≈ Java 反射拿方法签名，好处是 runAgent 改签名时这里编译期就会报错。
     const runAgentParams: Parameters<typeof runAgent>[0] = {
       agentDefinition: selectedAgent,
       promptMessages,
       toolUseContext,
       canUseTool,
       isAsync: shouldRunAsync,
+// querySource 用于埋点分类；fork 递归守卫也靠它识别「我是 fork 的孩子」
       querySource: toolUseContext.options.querySource ?? getQuerySourceForAgent(selectedAgent.agentType, isBuiltInAgent(selectedAgent)),
       model: isForkPath ? undefined : model,
       // Fork path: pass parent's system prompt AND parent's exact tool
@@ -619,6 +842,11 @@ export const AgentTool = buildTool({
       // or explicit cwd), skip the pre-built system prompt so runAgent's
       // buildAgentSystemPrompt() runs inside wrapWithCwd where getCwd()
       // returns the override path.
+// fork 路径：传父级 system prompt + 父级**完全一样**的工具数组（cache-identical 前缀）。
+// 注意不能用 workerTools：它是在 permissionMode 'bubble' 下重建的，工具定义序列化出来
+// 和父级不一样，会在第一个工具处就打断 cache。
+// 普通路径：只有在有 cwd 覆盖（worktree 或显式 cwd）时才**不**传预构建的 system prompt，
+// 好让 runAgent 在 wrapWithCwd 内部重算，此时 getCwd() 才是覆盖后的路径。
       override: isForkPath ? {
         systemPrompt: forkParentSystemPrompt
       } : enhancedSystemPrompt && !worktreeInfo && !cwd ? {
@@ -638,9 +866,17 @@ export const AgentTool = buildTool({
     // Helper to wrap execution with a cwd override: explicit cwd arg (KAIROS)
     // takes precedence over worktree isolation path.
     const cwdOverridePath = cwd ?? worktreeInfo?.worktreePath;
+// 高阶函数：把一段执行包在 cwd 覆盖里。显式 cwd 优先于 worktree 路径。
+// `<T,>` 里的逗号是 .tsx 的逃生写法——直接写 `<T>` 会被当成 JSX 标签。
     const wrapWithCwd = <T,>(fn: () => T): T => cwdOverridePath ? runWithCwdOverride(cwdOverridePath, fn) : fn();
 
     // Helper to clean up worktree after agent completes
+/**
+ * 子 Agent 结束后决定是否清理 worktree。
+ * 规则：没改东西就删掉（避免留一堆空 worktree）；改了东西就保留并把路径/分支回传给主 Agent。
+ * 做成幂等（把 worktreeInfo 置 null）是因为清理和 try 结束之间还可能抛异常进 catch，
+ * 会被调用两次。
+ */
     const cleanupWorktreeIfNeeded = async (): Promise<{
       worktreePath?: string;
       worktreeBranch?: string;
@@ -656,6 +892,7 @@ export const AgentTool = buildTool({
       // Null out to make idempotent — guards against double-call if code
       // between cleanup and end of try throws into catch
       worktreeInfo = null;
+// hook-based worktree 一律保留：这类 worktree 不走 VCS，检测不出有没有改动
       if (hookBased) {
         // Hook-based worktrees are always kept since we can't detect VCS changes
         logForDebugging(`Hook-based agent worktree kept at: ${worktreePath}`);
@@ -683,8 +920,11 @@ export const AgentTool = buildTool({
         worktreeBranch
       };
     };
+// ===== 异步分支：注册后台任务，立刻返回 async_launched ===== 
     if (shouldRunAsync) {
       const asyncAgentId = earlyAgentId;
+// 注册到本地任务表（tasks pill / TaskOutput 能查到）。注意**不**链接父级的 abortController：
+// 用户按 ESC 取消主线程时，后台 agent 应该活下来，只能通过 chat:killAgents 显式杀。
       const agentBackgroundTask = registerAsyncAgent({
         agentId: asyncAgentId,
         description,
@@ -697,6 +937,8 @@ export const AgentTool = buildTool({
         toolUseId: toolUseContext.toolUseId
       });
 
+// name → agentId 的映射，供 SendMessage({to: name}) 路由。
+// 放在 registerAsyncAgent **之后**，这样启动失败时不会留下一条悬空映射。
       // Register name → agentId for SendMessage routing. Post-registerAsyncAgent
       // so we don't leave a stale entry if spawn fails. Sync agents skipped —
       // coordinator is blocked, so SendMessage routing doesn't apply.
@@ -712,6 +954,8 @@ export const AgentTool = buildTool({
       }
 
       // Wrap async agent execution in agent context for analytics attribution
+// Analytics 归属用的 agent 上下文。parentSessionId：子 Agent 来自 teammate 时用 team lead 的
+// session，来自主 REPL 时是 undefined。
       const asyncAgentContext = {
         agentId: asyncAgentId,
         // For subagents from teammates: use team lead's session
@@ -730,6 +974,9 @@ export const AgentTool = buildTool({
       // invocation time — when this `void` fires — and survives every await
       // inside. No capture/restore needed; the detached closure sees the
       // parent turn's workload automatically, isolated from its finally.
+// `void` = 故意不 await，让子 Agent 在后台跑。
+// runWithAgentContext 用 AsyncLocalStorage 把 agentId 等元数据「贴」到这次异步执行上，
+// ALS 在调用**那一刻**捕获上下文，之后内部所有 await 都能看到，不需要手动传递。
       void runWithAgentContext(asyncAgentContext, () => wrapWithCwd(() => runAsyncAgentLifecycle({
         taskId: agentBackgroundTask.agentId,
         abortController: agentBackgroundTask.abortController!,
@@ -750,6 +997,7 @@ export const AgentTool = buildTool({
         enableSummarization: isCoordinator || isForkSubagentEnabled() || getSdkAgentProgressSummariesEnabled(),
         getWorktreeResult: cleanupWorktreeIfNeeded
       })));
+// 主 Agent 自己有没有 Read/Bash？有的话才在结果里告诉它「可以自己去 tail 输出文件看进度」
       const canReadOutputFile = toolUseContext.options.tools.some(t => toolMatchesName(t, FILE_READ_TOOL_NAME) || toolMatchesName(t, BASH_TOOL_NAME));
       return {
         data: {
@@ -762,6 +1010,7 @@ export const AgentTool = buildTool({
           canReadOutputFile
         }
       };
+// ===== 同步分支：边跑边转发进度，跑完直接收敛结果 =====
     } else {
       // Create an explicit agentId for sync agents
       const syncAgentId = asAgentId(earlyAgentId);
@@ -782,6 +1031,7 @@ export const AgentTool = buildTool({
 
       // Wrap entire sync agent execution in context for analytics attribution
       // and optionally in a worktree cwd override for filesystem isolation
+// 同步执行也要 runWithAgentContext（埋点归属）+ wrapWithCwd（worktree 隔离）
       return runWithAgentContext(syncAgentContext, () => wrapWithCwd(async () => {
         const agentMessages: MessageType[] = [];
         const agentStartTime = Date.now();
@@ -843,6 +1093,8 @@ export const AgentTool = buildTool({
         const summaryTaskId = foregroundTaskId;
 
         // Get async iterator for the agent
+// 拿到异步迭代器。runAgent 是 async generator（≈ Java 的 Flux），一条一条 yield 消息出来。
+// 这里显式取 [Symbol.asyncIterator] 是为了下面手写 while + Promise.race（要能中途切后台）。
         const agentIterator = runAgent({
           ...runAgentParams,
           override: {
@@ -870,6 +1122,7 @@ export const AgentTool = buildTool({
 
             // Show background hint after threshold (but task is already registered)
             // Skip if background tasks are disabled
+// 超过 2 秒还在跑，就渲染一个「可以按 ↓ 管理」的提示行
             if (!isBackgroundTasksDisabled && !backgroundHintShown && elapsed >= PROGRESS_THRESHOLD_MS && toolUseContext.setToolJSX) {
               backgroundHintShown = true;
               toolUseContext.setToolJSX({
@@ -883,6 +1136,10 @@ export const AgentTool = buildTool({
             // Race between next message and background signal
             // If background tasks are disabled, just await the next message directly
             const nextMessagePromise = agentIterator.next();
+// 关键设计：把「下一条消息」和「被转后台的信号」赛跑。
+// 这样用户在子 Agent 跑的过程中按下转后台，能立刻生效而不是等它跑完。
+// backgroundPromise 只创建一次（在上面），否则每轮循环都往同一个 pending promise 上
+// 挂一个 .then 回调，会一直累积。
             const raceResult = backgroundPromise ? await Promise.race([nextMessagePromise.then(r => ({
               type: 'message' as const,
               result: r
@@ -894,6 +1151,7 @@ export const AgentTool = buildTool({
             // Check if we were backgrounded via backgroundAll()
             // foregroundTaskId is guaranteed to be defined if raceResult.type is 'background'
             // because backgroundPromise is only defined when foregroundTaskId is defined
+// 赛跑结果是「被转后台」：把剩下的执行交给后台闭包，本函数立刻返回 async_launched
             if (raceResult.type === 'background' && foregroundTaskId) {
               const appState = toolUseContext.getAppState();
               const task = appState.tasks[foregroundTaskId];
@@ -915,6 +1173,8 @@ export const AgentTool = buildTool({
                     // (releases MCP connections, session hooks, prompt cache tracking, etc.)
                     // Timeout prevents blocking if MCP server cleanup hangs.
                     // .catch() prevents unhandled rejection if timeout wins the race.
+// 先让前台迭代器 return()，触发它的 finally（释放 MCP 连接、session hooks、cache 追踪等）。
+// 加 1 秒超时是防止 MCP server 清理卡死；.catch() 防止超时赢了之后产生 unhandled rejection。
                     await Promise.race([agentIterator.return(undefined).catch(() => {}), sleep(1000)]);
                     // Initialize progress tracking from existing messages
                     const tracker = createProgressTracker();
@@ -922,6 +1182,8 @@ export const AgentTool = buildTool({
                     for (const existingMsg of agentMessages) {
                       updateProgressFromMessage(tracker, existingMsg, resolveActivity2, toolUseContext.options.tools);
                     }
+// 用**新的** runAgent 继续跑（isAsync: true + 后台任务的 abortController）。
+// 不是接着旧迭代器消费，因为旧的 return() 已经把它的清理逻辑跑掉了。
                     for await (const msg of runAgent({
                       ...runAgentParams,
                       isAsync: true,
@@ -954,6 +1216,9 @@ export const AgentTool = buildTool({
                     // unblocks immediately. classifyHandoffIfNeeded and
                     // cleanupWorktreeIfNeeded can hang — they must not gate
                     // the status transition (gh-20236).
+// 先标记任务完成，再做 handoff 分类和 worktree 清理。顺序很重要：
+// 这两个操作（一个调 API 一个跑 git）都可能卡住，绝不能让它们挡住状态流转，
+// 否则 TaskOutput(block=true) 会一直阻塞（gh-20236）。
                     completeAsyncAgent(agentResult, rootSetAppState);
 
                     // Extract text from agent result content for the notification
@@ -989,6 +1254,8 @@ export const AgentTool = buildTool({
                       toolUseId: toolUseContext.toolUseId,
                       ...worktreeResult
                     });
+// AbortError = 用户取消。同样先切状态再清 worktree，理由同上。
+// 被杀掉时也不浪费已有成果：用 extractPartialResult 把已完成的部分文本带回去。
                   } catch (error) {
                     if (error instanceof AbortError) {
                       // Transition status BEFORE worktree cleanup so
@@ -1147,6 +1414,7 @@ export const AgentTool = buildTool({
 
           // Store the error to handle after cleanup
           syncAgentError = toError(error);
+// finally：无论正常结束、被取消还是出错，都要清 UI、停摘要、注销前台任务、清缓存、清 worktree
         } finally {
           // Clear the background hint UI
           if (toolUseContext.setToolJSX) {
@@ -1188,6 +1456,7 @@ export const AgentTool = buildTool({
 
           // Clean up dumpState entry for this agent to prevent unbounded growth
           // Skip if backgrounded — the backgrounded agent's finally handles cleanup
+// 已经被转后台的话不要清 dumpState：后台那个闭包还在跑，它自己的 finally 会清
           if (!wasBackgrounded) {
             clearDumpState(syncAgentId);
           }
@@ -1204,6 +1473,8 @@ export const AgentTool = buildTool({
 
         // Re-throw abort errors
         // TODO: Find a cleaner way to express this
+// 如果最后一条消息是「合成消息」（synthetic），说明是用户中断留下的占位，按取消处理。
+// findLast 从后往前找第一个满足条件的元素（≈ Java 没有的直接方法，得自己倒着遍历）。
         const lastMessage = agentMessages.findLast(_ => _.type !== 'system' && _.type !== 'progress');
         if (lastMessage && isSyntheticMessage(lastMessage)) {
           logEvent('tengu_agent_tool_terminated', {
@@ -1220,6 +1491,8 @@ export const AgentTool = buildTool({
         // If an error occurred during iteration, try to return a result with
         // whatever messages we have. If we have no assistant messages,
         // re-throw the error so it's properly handled by the tool framework.
+// 迭代出错但已经攒了一些 assistant 消息：尽量把已有进展返回给主 Agent，
+// 而不是把整个子 Agent 的工作全丢掉。一条 assistant 消息都没有才真的抛错。
         if (syncAgentError) {
           // Check if we have any assistant messages to return
           const hasAssistantMessages = agentMessages.some(msg => msg.type === 'assistant');
@@ -1232,6 +1505,7 @@ export const AgentTool = buildTool({
           // This allows the parent agent to see partial progress even after an error
           logForDebugging(`Sync agent recovering from error with ${agentMessages.length} messages`);
         }
+// 收敛最终结果：取最后一条 assistant 的文本当 content，统计 tool use 次数、token、耗时
         const agentResult = finalizeAgentTool(agentMessages, syncAgentId, metadata);
         if (feature('TRANSCRIPT_CLASSIFIER')) {
           const currentAppState = toolUseContext.getAppState();
@@ -1250,6 +1524,7 @@ export const AgentTool = buildTool({
             }, ...agentResult.content];
           }
         }
+// 同步完成的返回：status='completed' + content + usage，主 Agent 会把它当作普通 tool_result 收到
         return {
           data: {
             status: 'completed' as const,
@@ -1264,6 +1539,7 @@ export const AgentTool = buildTool({
   isReadOnly() {
     return true; // delegates permission checks to its underlying tools
   },
+// 给自动模式分类器看的输入：把 subagent_type / mode 拼成 `(X, mode=plan): prompt` 的形式
   toAutoClassifierInput(input) {
     const i = input as AgentToolInput;
     const tags = [i.subagent_type, i.mode ? `mode=${i.mode}` : undefined].filter((t): t is string => t !== undefined);
@@ -1278,6 +1554,11 @@ export const AgentTool = buildTool({
   getActivityDescription(input) {
     return input?.description ?? 'Running task';
   },
+/**
+ * 权限检查。除了 ant 内部的 auto 模式要走分类器，其它模式一律直接放行。
+ * 为什么子 Agent 不弹权限框：子 Agent 没有独立终端可以弹 UI，
+ * 它的权限要么来自 agent 定义里的 permissionMode，要么在 runAgent 里被自动 deny。
+ */
   async checkPermissions(input, context): Promise<PermissionResult> {
     const appState = context.getAppState();
 
@@ -1295,6 +1576,14 @@ export const AgentTool = buildTool({
       updatedInput: input
     };
   },
+/**
+ * 把 call() 的返回值翻译成发给模型的 tool_result 文本——这是「子 Agent 结果回传给主 Agent」
+ * 的最后一环。不同 status 回传的文本差别很大：
+ *   - teammate_spawned：告诉主 Agent 已经起了个独立进程，之后用 mailbox 沟通
+ *   - remote_launched：给 taskId + session url，并明确要求「简短告诉用户你起了什么就结束回合」
+ *   - async_launched：给 agentId + 输出文件路径，并警告不要重复子 Agent 的工作
+ *   - completed：子 Agent 的最终文本 + agentId（可用 SendMessage 续跑）+ <usage> 用量块
+ */
   mapToolResultToToolResultBlockParam(data, toolUseID) {
     // Multi-agent spawn result
     const internalData = data as InternalOutput;
@@ -1344,6 +1633,8 @@ The agent is now running and will receive instructions via mailbox.`
       // agentId/usage trailer below — a metadata-only block at the prompt tail.
       // Some models read that as "nothing to act on" and end their turn
       // immediately. Say so explicitly so the parent has something to react to.
+// 子 Agent 一个字都没返回时，tool_result 只剩下面那点元数据。有些模型读到「没内容」
+// 就直接结束回合了，所以明确写一句「子 Agent 已完成但没有输出」，给主 Agent 一个可反应的东西。
       const contentOrMarker = data.content.length > 0 ? data.content : [{
         type: 'text' as const,
         text: '(Subagent completed but returned no output.)'
@@ -1353,6 +1644,8 @@ The agent is now running and will receive instructions via mailbox.`
       // 34M Explore runs/week ≈ 1-2 Gtok/week). Telemetry doesn't parse this
       // block (it uses logEvent in finalizeAgentTool), so dropping is safe.
       // agentType is optional for resume compat — missing means show trailer.
+// Explore / Plan 这类一次性内置 agent 从不会被 SendMessage 续跑，
+// 所以 agentId 提示和 <usage> 块是纯浪费（每周 34M 次 Explore × 约 135 字符）。这里整段省掉。
       if (data.agentType && ONE_SHOT_BUILTIN_AGENT_TYPES.has(data.agentType) && !worktreeInfoText) {
         return {
           tool_use_id: toolUseID,
@@ -1372,6 +1665,8 @@ duration_ms: ${data.totalDurationMs}</usage>`
         }]
       };
     }
+// `data satisfies never`：穷尽性检查。走到这一行说明上面的分支已经覆盖所有 status，
+// 将来 union 里加了新成员而这里没处理，编译期就会报错。
     data satisfies never;
     throw new Error(`Unexpected agent tool result status: ${(data as {
       status: string;
@@ -1385,6 +1680,10 @@ duration_ms: ${data.totalDurationMs}</usage>`
   renderToolUseErrorMessage,
   renderGroupedToolUse: renderGroupedAgentToolUse
 } satisfies ToolDef<InputSchema, Output, Progress>);
+/**
+ * 解析团队名：入参优先，其次用当前 session 的 team 上下文。
+ * agent teams 功能没开时直接返回 undefined（等于关闭多 Agent 分支）。
+ */
 function resolveTeamName(input: {
   team_name?: string;
 }, appState: {

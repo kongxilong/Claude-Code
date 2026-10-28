@@ -1,3 +1,116 @@
+/**
+ * ============================================================================
+ *  【一句话定位】FileEditTool/UI.tsx —— 编辑类工具在终端里的「长相」（渲染层）
+ * ============================================================================
+ *
+ *  本文件**没有任何业务逻辑**，只回答一个问题：
+ *  "这次编辑，在屏幕上给用户看什么？"
+ *      · 工具被调用时           → renderToolUseMessage()        渲染文件路径
+ *      · 编辑成功后             → renderToolResultMessage()     渲染改动 diff
+ *      · 用户拒绝了这次编辑     → renderToolUseRejectedMessage() 渲染"本该发生的 diff"
+ *      · 编辑出错               → renderToolUseErrorMessage()    渲染一句人话错误
+ *
+ * ---------------------------------------------------------------------------
+ *  【⚠️ 在读这个文件之前必须先知道的一件事：它是"编译产物"】
+ * ---------------------------------------------------------------------------
+ *  看第 1 行 `import { c as _c } from "react/compiler-runtime"` 和末尾那一长串
+ *  `//# sourceMappingURL=data:...base64,...` —— 这不是人写的代码。
+ *
+ *  它是 React Compiler（Forget）把原始 JSX 源码**编译优化后**的产物：
+ *      · 原始 handwritten 的组件函数变成了 `EditRejectionDiff(t0)` 这种形式，
+ *        参数名被压成 t0/t1/t2，中间变量也全变成 t1..t4；
+ *      · `$ = _c(16)` 申请一个长度 16 的**缓存槽数组**，
+ *        `if ($[0] !== filePath) { ... $[0] = filePath; $[4] = t1 }` 是编译器自动插入的
+ *        **记忆化（memoization）**：依赖没变就复用上次算好的 React 元素，跳过重渲染。
+ *        ≈ Java 里手写的 memoized getter + volatile 缓存字段，只不过这里是编译器代劳。
+ *      · 末尾的 sourcemap 用来把编译产物映射回原始 UI.tsx，方便调试/断点。
+ *
+ *  【结论】改这个文件没用（下次编译会被覆盖），要看逻辑应该看 `src/components/` 下
+ *  被引用的那几个真正组件：FileEditToolUpdatedMessage、FileEditToolUseRejectedMessage 等。
+ *  本文件剩下这些函数是**手写在文件顶部区域、未被编译器大幅改写**的纯展示函数。
+ *
+ *  为什么要专门有人写这一层？
+ *      LLM 的编辑结果给用户看时必须"一眼看懂"：
+ *      文件名 + diff + 是否被用户手改过。看不懂用户就不敢批准，agent 就跑不起来。
+ *
+ * ---------------------------------------------------------------------------
+ *  【在架构中的位置 / 调用链】
+ * ---------------------------------------------------------------------------
+ *      工具框架 src/Tool.ts
+ *        └─> 按约定调用本文件导出的钩子
+ *              ├─ userFacingName(input)               → 'Update' / 'Create' / 'Updated plan'
+ *              ├─ getToolUseSummary(input)            → 给一行摘要用（一般是文件名）
+ *              ├─ renderToolUseMessage(...)           → <FilePathLink/>
+ *              ├─ renderToolResultMessage(...)        → <FileEditToolUpdatedMessage/>（src/components/）
+ *              ├─ renderToolUseRejectedMessage(...)   → <EditRejectionDiff/> → loadRejectionDiff()
+ *              └─ renderToolUseErrorMessage(...)      → <FallbackToolUseErrorMessage/>
+ *
+ *      内部私有部分（渲染"被拒绝的编辑长什么样"）：
+ *          renderToolUseRejectedMessage()
+ *              └─> <EditRejectionDiff/>         （React Compiler 编译过的组件）
+ *                    └─> loadRejectionDiff()    ← ★本文件唯一的逻辑函数
+ *                          ├─> readEditContext()      ← ../../utils/readEditContext.js（按上下文窗口分块读）
+ *                          ├─> getPatchForEdit()      ← ./utils.js（与真正执行时**共用同一个** diff 实现）
+ *                          └─> adjustHunkLineNumbers() ← ../../utils/diff.js（把行号平移回全文件坐标系）
+ *
+ * ---------------------------------------------------------------------------
+ *  【本文件包含什么】
+ * ---------------------------------------------------------------------------
+ *   1. userFacingName()                 UI 上显示的操作名
+ *   2. getToolUseSummary()              单行摘要
+ *   3. renderToolUseMessage()           调用时的路径渲染
+ *   4. renderToolResultMessage()        成功后渲染 diff
+ *   5. renderToolUseRejectedMessage()   被拒绝时渲染"本来会发生的 diff"
+ *   6. renderToolUseErrorMessage()      错误文案渲染
+ *   7. EditRejectionDiff/Body           两个编译过的内部组件（带 Suspense 异步加载 diff）
+ *   8. loadRejectionDiff()              ★异步算出"如果执行了会得到什么 diff"
+ *
+ * ---------------------------------------------------------------------------
+ *  【TS / React 语法速查 · Java 对照】
+ *  --------------------------------------------------------------------------
+ *   · `.tsx` 后缀 = TS + JSX。JSX 允许在代码里**直接写标签**：
+ *         return <Text dimColor>File must be read first</Text>
+ *     它会被编译成函数调用（React.createElement），最终构成一棵**组件树**。
+ *     ≈ Java 里没有对应物；最接近的是「用 DSL 拼一棵 Swing 组件树」，
+ *       但 JSX 是语言级语法，由编译器生成，比手写 builder 清爽得多。
+ *
+ *   · `React.ReactNode` / `React.ReactElement`：
+ *     前者 = "任何可以渲染的东西"（含字符串、null、数组），后者 = 严格的一个元素。
+ *     ≈ Java 的 JComponent vs Object 的区别，粒度不同。
+ *
+ *   · 返回值写成 `: React.ReactNode` —— 类型标注后置，Java 工程师最容易看串。
+ *
+ *   · `Partial<{ file_path: string; ... }>`：
+ *     把对象类型里所有字段变成可选。≈ 生成一个"字段全可空"的 DTO。
+ *     这里用它是因为 UI 拿到的是模型原始输出，**可能缺字段**，不能假设它完整。
+ *
+ *   · `input?: string` / `edits?: unknown[]`：字段名后带问号 = 可选字段（可能为 undefined）。
+ *
+ *   · `input.file_path?.startsWith(...)` 可选链：
+ *     ≈ Java 的 `fp != null && fp.startsWith(...)`。file_path 可能压根不存在。
+ *
+ *   · `input.old_string ?? ''` 空值合并：
+ *     只在值为 null/undefined 时用 ''。
+ *     ⚠️ 与 `||` 的关键区别：`''`（空串）和 `0` 会被 `||` 替换成默认值，
+ *        但不会被 `??` 替换。这里明明要保留"空串代表新建文件"的语义，所以必须用 `??`。
+ *
+ *   · 大括号 `{...}` 在 JSX 里表示"这里是 JS 表达式"：
+ *         <FilePathLink filePath={file_path}>{verbose ? file_path : getDisplayPath(...)}</FilePathLink>
+ *     里面那个 `? :` 是三元运算符（≈ Java 的三元），返回字符串走进 JSX 当子节点。
+ *
+ *   · `<Suspense fallback={t2}>{t3}</Suspense>` + `use(promise)`：
+ *     React 的异步渲染原语。`use(promise)` 会**挂起**组件直到 promise resolve，
+ *     期间显示 fallback。≈ Java 里 CompletableFuture + 占位 UI，
+ *     但 React 把它做成了语言级的"挂起-恢复"机制，不需要回调地狱。
+ *
+ *   · `useState(t1)`：钩子。注意这里传的是**函数** t1，
+ *     表示"惰性初始化"——只在首次渲染时调用一次，重渲染不会重复算。
+ *
+ *   · `_progressMessagesForMessage` 前缀下划线 = 该参数不用（占位满足接口形状）。
+ *
+ *   · `e as Error`：类型断言 ≈ Java 强制转换。catch 里 e 是 unknown，需要断言成 Error
+ *     才能传给 logError。（TS 严格模式下的常见补丁写法。）
+ */
 import { c as _c } from "react/compiler-runtime";
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs';
 import type { StructuredPatchHunk } from 'diff';
@@ -21,6 +134,21 @@ import { firstLineOf } from '../../utils/stringUtils.js';
 import type { ThemeName } from '../../utils/theme.js';
 import type { FileEditOutput } from './types.js';
 import { findActualString, getPatchForEdit, preserveQuoteStyle } from './utils.js';
+/**
+ * 这个操作在 UI 上叫什么名字。
+ *
+ * @param input 模型的原始入参（可能是畸形/缺失字段，故用 Partial 宽松接收）
+ * @returns 'Update' | 'Create' | 'Updated plan'
+ *
+ * 【为什么要单独喝ols一个函数，而不是统一叫 "Edit"？】
+ * 因为同一把工具在用户眼里其实是三种行为，UI 要区别对待才有信息量：
+ *   · old_string 为空  ⇒ 'Create'      （本质是新建文件）
+ *   · 路径在 plans 目录 ⇒ 'Updated plan'（用户此刻在改"计划"，语境完全不同）
+ *   · 其余             ⇒ 'Update'
+ *
+ * 【为什么拿 Source of truth 是 old_string 而不是别的？】
+ * 因为 FileEditTool 的语义里"old_string 为空 == 新建"，这是整个工具链的既定约定。
+ */
 export function userFacingName(input: Partial<{
   file_path: string;
   old_string: string;
@@ -43,6 +171,15 @@ export function userFacingName(input: Partial<{
   }
   return 'Update';
 }
+/**
+ * 一行式摘要（用于折叠视图、工具调用列表）。
+ *
+ * @returns 相对展示路径；没有 file_path 时返回 null（调用方据此什么都不显示）
+ *
+ * 【为什么返回 null 而不是空字符串？】
+ * 用 null 表达"没有"，比 '' 更明确，避免渲染出一个空的占位。
+ * ≈ Java 里返回 Optional<String> 而不是 Optional.of("")。
+ */
 export function getToolUseSummary(input: Partial<{
   file_path: string;
   old_string: string;
@@ -54,6 +191,23 @@ export function getToolUseSummary(input: Partial<{
   }
   return getDisplayPath(input.file_path);
 }
+/**
+ * 【工具正在被调用时】用户第一眼看到的东西 —— 就是那个文件路径。
+ *
+ * 【为什么路径这里要分 verbose？】
+ *   · 普通模式：显示**相对路径**（短、可读，用户关心的是仓库内的位置）
+ *   · verbose  ：显示**绝对路径**（排错时有用）
+ * 这是纯 UX 取舍：屏幕寸土寸金，默认给短的。
+ *
+ * 【为什么 plan 文件直接返回空串 ''？】
+ * 因为 "Updated plan" 这个语义已经由 userFacingName() 显示过了，
+ * 这里再重复一次路径是冗余。返回 '' 而不是 null：
+ * '' 是合法 ReactNode（渲染成"什么都没有"），保证类型统一。
+ *
+ * 【TS 语法】参数写成解构 + 类型标注：
+ *   `{ file_path }: { file_path?: string; }, { verbose }: { verbose: boolean }`
+ *   ≈ 把两个参数各自拆包；注意第二个对象的类型直接内联写在后面。
+ */
 export function renderToolUseMessage({
   file_path
 }: {
@@ -74,6 +228,21 @@ export function renderToolUseMessage({
       {verbose ? file_path : getDisplayPath(file_path)}
     </FilePathLink>;
 }
+/**
+ * 【编辑成功后】把改动渲染给用户看。
+ *
+ * @param filePath/structuredPatch/originalFile  从 FileEditOutput 里解构出来的三个字段
+ * @param 第二参数  ProgressMessage[]，本渲染不用（下划线占位）
+ * @param options  { style, verbose } —— style='condensed' 时渲染紧凑版
+ *
+ * 【为什么要把 originalFile（改之前的整份内容）传下去？】
+ * 因为 UI 需要知道"改动发生在文件的哪个位置"才好做上下文提示，
+ * 这里取其**第一行** `originalFile.split('\n')[0] ?? null` 作为定位 hint。
+ * `?? null` 是为了防偶尔出现的空文件（split 后 [0] 可能不存在 → undefined）。
+ *
+ * 【plan 文件为什么要额外加 '/plan to preview' 提示？】
+ * 因为改的是"计划"，用户下一步最可能想做的事是预览这份计划，顺手给个提示。
+ */
 export function renderToolResultMessage({
   filePath,
   structuredPatch,
@@ -89,6 +258,23 @@ export function renderToolResultMessage({
   const isPlanFile = filePath.startsWith(getPlansDirectory());
   return <FileEditToolUpdatedMessage filePath={filePath} structuredPatch={structuredPatch} firstLine={originalFile.split('\n')[0] ?? null} fileContent={originalFile} style={style} verbose={verbose} previewHint={isPlanFile ? '/plan to preview' : undefined} />;
 }
+/**
+ * 【用户拒绝了这次编辑时】渲染"如果批准了会发生什么"的 diff。
+ *
+ * 【为什么拒绝了还要费劲算 diff？因为这是给用户做**决策**用的】
+ * 用户点"否"之前，屏幕上必须让他看懂要改哪一行、改成什么样。
+ * 不渲染 diff 的话，用户等于在盲签。
+ *
+ * 【两条分支】
+ *   · old_string 为空 ⇒ 新建文件 ⇒ 渲染"内容预览"（operation="write"）
+ *   · 否则           ⇒ 渲染 diff（走 <EditRejectionDiff/>）
+ *
+ * 【为什么要防御性地检查 'edits' in input？】
+ * 因为存在另一种"多段编辑"形态的工具输入（input.edits 是数组），
+ * 本渲染器只吃单段编辑（old_string/new_string）。万一上游传错形状，
+ * 宁可退化成一句简单的拒绝提示，也别崩整个 REPL。
+ * `'edits' in input` 是 JS 的 in 运算符，判断对象上有没有这个键。
+ */
 export function renderToolUseRejectedMessage(input: {
   file_path: string;
   old_string?: string;
@@ -117,6 +303,7 @@ export function renderToolUseRejectedMessage(input: {
   if ('edits' in input && input.edits != null) {
     return <FileEditToolUseRejectedMessage file_path={filePath} operation="update" firstLine={null} verbose={verbose} />;
   }
+    // 复用 FileEditTool 的既定语义：old_string 为空 ⇒ 新建文件。
   const isNewFile = oldString === '';
 
   // For new file creation, show content preview instead of diff
@@ -125,6 +312,25 @@ export function renderToolUseRejectedMessage(input: {
   }
   return <EditRejectionDiff filePath={filePath} oldString={oldString} newString={newString} replaceAll={replaceAll} style={style} verbose={verbose} />;
 }
+/**
+ * 【编辑出错时】把错误信息渲染成人话。
+ *
+ * 【为什么用 string includes 匹配错误文案这么糙的办法？】
+ * 因为 result 是从 tool_result 里拿回来的一段**文本**，不是结构化错误对象。
+ * 短期 pragmatic 的做法就是"看文案里有没有这句"。
+ * 这里刻意把两类错误"降噪"：
+ *   · 'File has not been read yet' → 'File must be read first'
+ *     （原句是给模型的责备语气，给用户看会莫名可怕）
+ *   · 文件不存在 → 'File not found'（红色）
+ * 其余一律兜底成 'Error editing file'。
+ *
+ * 【为什么非 verbose 才走这条美化路径？】
+ * verbose 模式下用户明确要求看**完整原始错误**，那就不能再隐藏细节。
+ *
+ * 【TS 语法】`ToolResultBlockParam['content']` 是**索引访问类型**：
+ * 取出 ToolResultBlockParam 这个类型里 content 字段的类型。
+ * ≈ Java 里没有；类似反射取字段类型的编译期版本。
+ */
 export function renderToolUseErrorMessage(result: ToolResultBlockParam['content'], options: {
   progressMessagesForMessage: ProgressMessage[];
   tools: Tools;
@@ -152,11 +358,35 @@ export function renderToolUseErrorMessage(result: ToolResultBlockParam['content'
   }
   return <FallbackToolUseErrorMessage result={result} verbose={verbose} />;
 }
+/**
+ * 被拒绝编辑的 diff 数据形状。
+ *
+ * 【为什么 fileContent 是 `string | undefined` 而 firstLine 是 `string | null`？】
+ * TS 里这两种"没有"的写法都很常见，这里混用是因为**消费方不同**：
+ *   · undefined 给 React props（JSX 里不传该 prop 就等价于 undefined）
+ *   · null      给明确"我知道没有，显式传个空"的场景
+ * 实际语义差别不大，读代码时知道两者都能表示"无"即可。
+ */
 type RejectionDiffData = {
   patch: StructuredPatchHunk[];
   firstLine: string | null;
   fileContent: string | undefined;
 };
+/**
+ * 【React Compiler 编译产物，读不懂是正常的】
+ *
+ * 原始代码大概是：把 loadRejectionDiff() 的 promise 用 useState 惰性持有，
+ * 再用 <Suspense> 包裹异步组件 EditRejectionBody。
+ *
+ * t0 是编译后合并的 props 对象；`$ = _c(16)` 取 16 个记忆化槽；
+ * 每个 `if ($[i] !== dep) { 重算; $[i] = dep; $[j] = 结果 } else { 用缓存 }`
+ * 就是编译器自动加的 **记忆化**。
+ *
+ * 【这么做图什么？】
+ * 终端 UI（ink）重渲染很频繁，每次都重新生成 diff 元素会明显卡顿。
+ * 依赖没变时直接复用上次的 React 元素，代价极小、收益明显。
+ * ≈ Java 里手写 `if (cachedDep != newDep) { recompute(); }` 的缓存分支。
+ */
 function EditRejectionDiff(t0) {
   const $ = _c(16);
   const {
@@ -210,6 +440,14 @@ function EditRejectionDiff(t0) {
   }
   return t4;
 }
+/**
+ * Suspense 边界内的真正渲染体：await 那个 promise 拿到 diff 数据后塞进组件。
+ *
+ * 【为什么要有这层壳？】
+ * `use(promise)` 会让组件**挂起**，而挂起的组件不能和 Suspense 写在同一个函数里，
+ * 必须拆出一个子组件承载挂起。这是 React 的硬性要求。
+ * 好处是：diff 还在读文件时，终端先显示占位而不是卡死白屏。
+ */
 function EditRejectionBody(t0) {
   const $ = _c(7);
   const {
@@ -238,11 +476,46 @@ function EditRejectionBody(t0) {
   }
   return t1;
 }
+/**
+ * 【本文件唯一的"真"业务逻辑】算出"如果批准，会得到什么样的一份 diff"。
+ *
+ * @param filePath    目标文件
+ * @param oldString   模型要替换的原文
+ * @param newString   替换后的内容
+ * @param replaceAll  是否全部替换
+ * @returns { patch, firstLine, fileContent }
+ *
+ * 【为什么能看到未来的 diff？】
+ * 因为它调用的是 ./utils.js 的 **getPatchForEdit** —— 和真正执行编辑时用的是
+ * **同一个函数**。这很重要：预览与执行的结果必须严格一致，
+ * 否则用户看到的 diff 和实际改动可能对不上（不可原谅的事故）。
+ *
+ * ── 关键步骤 ──
+ * ① readEditContext()：**只读目标片段附近的一小段**（CONTEXT_LINES 行）
+ *      —— 为什么要这么麻烦？因为被编辑的文件可能上百万行，全读进来只为渲染预览太浪费。
+ * ② 读失败/截断/文件不存在 → 退化：直接拿模型的 old_string→new_string 做 diff。
+ *      —— 宁可给个"不够完整"的 diff，也不要什么都不显示。
+ * ③ findActualString + preserveQuoteStyle：和真正执行时做同样的引号归一化，
+ *      保证预览 diff 与实际 diff 一致。
+ * ④ adjustHunkLineNumbers(patch, ctx.lineOffset - 1)：把行号**平移**回全文件坐标系。
+ *      —— 因为我们只读了片段，patch 里的行号是片段内的相对行号；
+ *         不平移的话用户会看到错误的文件行号。-1 是因为行号从 1 开始而偏移从 0 开始。
+ * ⑤ 文件首行只在 lineOffset===1（即确实从文件头读起）时才给，避免误导。
+ * ⑥ catch 兜底返回空 patch：最常见的失败原因是"用户在 diff 展示期间自己手改了文件"，
+ *     这不是错误，不该弹红字——静默退化即可。
+ */
 async function loadRejectionDiff(filePath: string, oldString: string, newString: string, replaceAll: boolean): Promise<RejectionDiffData> {
   try {
     // Chunked read — context window around the first occurrence. replaceAll
     // still shows matches *within* the window via getPatchForEdit; we accept
     // losing the all-occurrences view to keep the read bounded.
+    // 【为什么是"分块读"而不是读整份文件？】
+    // 预览只需要看 old_string 附近那几行。对上 GB 的日志/数据文件，
+    // 全量读会让 UI 卡好几秒。readEditContext 只围绕命中位置取上下文窗口。
+    //
+    // 【代价是什么？】replaceAll 时，只会显示这个窗口**内**的匹配，
+    // 窗口外的替换看不见。这是明确的取舍（上面英文注释也承认了）：
+    // 宁可预览不完整，也要把读盘量控制在有界范围内。
     const ctx = await readEditContext(filePath, oldString, CONTEXT_LINES);
     if (ctx === null || ctx.truncated || ctx.content === '') {
       // ENOENT / not found / truncated — diff just the tool inputs.
@@ -272,7 +545,11 @@ async function loadRejectionDiff(filePath: string, oldString: string, newString:
       replaceAll
     });
     return {
+      // 把"片段坐标"平移回"全文件坐标"。-1 是因为行号从 1 起算。
+      // 不做这步的话，用户在 1000 行处看到被标成第 3 行，会直接怀疑人生。
       patch: adjustHunkLineNumbers(patch, ctx.lineOffset - 1),
+      // 只有确实是从文件第一行的代码片段起读的，才敢说"这是文件的第一行"。
+      // 否则<｜hy_place▁holder▁no▁813｜>返回 null —— 宁缺毋滥，别给假的上下文提示。
       firstLine: ctx.lineOffset === 1 ? firstLineOf(ctx.content) : null,
       fileContent: ctx.content
     };

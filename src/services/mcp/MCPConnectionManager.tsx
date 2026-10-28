@@ -1,9 +1,35 @@
+/**
+ * 【一句话定位】React 组件：把 MCP「重连 / 启停」两个能力通过 Context 提供给整棵组件树。
+ *
+ * 【在架构中的位置】
+ * - 上游：App 根组件把它包在最外层，传入 dynamicMcpConfig 与 isStrictMcpConfig。
+ * - 下游：useManageMCPConnections()——真正的连接管理逻辑在那个 hook 里，本文件只负责
+ *   把 hook 的结果「广播」出去，让任意深层组件（如 /mcp 界面）通过 useMcpReconnect() 拿到。
+ * - 消费方：任何需要「重连某个 MCP server」或「切换启用状态」的 UI。
+ *
+ * 【为什么要有这层 Context】
+ * 深层组件不该为了拿一个回调函数而层层透传 props（React 里叫 prop drilling）；
+ * Context ≈ 依赖注入容器，一处提供、任意处注入。
+ *
+ * 【TS / React 语法速查】
+ * - `interface X { ... }` ≈ Java 的 interface，但只描述结构、编译后不存在。
+ * - `createContext<X | null>(null)`：创建一个「广播频道」，默认值 null。
+ * - `useContext(X)`：读取 Context，≈ 从 DI 容器里取bean；取不到就说明组件不在 Provider 内部，直接抛错。
+ * - `(name: string) => Promise<{...}>`：函数类型，≈ Java 的 Function<String, CompletableFuture<...>>。
+ * - `children: ReactNode`：React 的「子节点」类型，≈ 组件标签之间夹的内容。
+ * - `<Provider value={x}>{children}</Provider>`：JSX 语法——在 TS 代码里直接写 XML/HTML 标签，
+ *   编译后变成函数调用；这是 .tsx 文件与普通 .ts 文件唯一的区别。
+ * - 本文件是 React Compiler 编译后的产物：`_c(6)`、`$[0]`、`t0/t1/t2` 这些是编译器生成的
+ *   记忆化（memoization）槽位，用来在重渲染时复用上次的结果（≈ 手写 useMemo 的自动化版本）。
+ */
 import { c as _c } from "react/compiler-runtime";
 import React, { createContext, type ReactNode, useContext, useMemo } from 'react';
 import type { Command } from '../../commands.js';
 import type { Tool } from '../../Tool.js';
 import type { MCPServerConnection, ScopedMcpServerConfig, ServerResource } from './types.js';
 import { useManageMCPConnections } from './useManageMCPConnections.js';
+  // 中文：Context 里只放两个能力——重连某个 server（返回重连后的 client/tools/commands/resources）、
+  //       以及切换某个 server 的启用状态
 interface MCPConnectionContextValue {
   reconnectMcpServer: (serverName: string) => Promise<{
     client: MCPServerConnection;
@@ -14,6 +40,7 @@ interface MCPConnectionContextValue {
   toggleMcpServer: (serverName: string) => Promise<void>;
 }
 const MCPConnectionContext = createContext<MCPConnectionContextValue | null>(null);
+  // 中文：初始值为 null，配合下面两个 hook 里的判空抛错，能立刻发现「组件忘了包 Provider」
 export function useMcpReconnect() {
   const context = useContext(MCPConnectionContext);
   if (!context) {
@@ -28,6 +55,8 @@ export function useMcpToggleEnabled() {
   }
   return context.toggleMcpServer;
 }
+  // 中文：组件 props：children 是要渲染的子树；dynamicMcpConfig 是运行时动态下发的 MCP 配置；
+  //       isStrictMcpConfig 表示是否只允许使用这些动态配置（禁止用户自行添加）
 interface MCPConnectionManagerProps {
   children: ReactNode;
   dynamicMcpConfig: Record<string, ScopedMcpServerConfig> | undefined;
@@ -35,6 +64,11 @@ interface MCPConnectionManagerProps {
 }
 
 // TODO (ollie): We may be able to get rid of this context by putting these function on app state
+  /**
+   * 中文：Provider 组件。把 useManageMCPConnections() 产出的两个函数放进 Context 供全局使用。
+   * 为什么逻辑放在 hook 而不是这里（英文 TODO 也提到）：理想情况下这些函数可以直接挂到 app state，
+   * 省掉这一层 Context；目前保留是为了兼容现有的组件结构。
+   */
 export function MCPConnectionManager(t0) {
   const $ = _c(6);
   const {
@@ -46,6 +80,7 @@ export function MCPConnectionManager(t0) {
     reconnectMcpServer,
     toggleMcpServer
   } = useManageMCPConnections(dynamicMcpConfig, isStrictMcpConfig);
+  // 中文：真正干活的是这个 hook——连接的建立、状态机维护、tool 转换都在里面（见 useManageMCPConnections.ts）
   let t1;
   if ($[0] !== reconnectMcpServer || $[1] !== toggleMcpServer) {
     t1 = {
@@ -61,6 +96,8 @@ export function MCPConnectionManager(t0) {
   const value = t1;
   let t2;
   if ($[3] !== children || $[4] !== value) {
+  // 中文：JSX：<Provider value={value}>{children}</Provider> 编译后等价于
+  //       createElement(Provider, { value }, children) —— 这里用编译器的记忆化槽位避免无谓重渲染
     t2 = <MCPConnectionContext.Provider value={value}>{children}</MCPConnectionContext.Provider>;
     $[3] = children;
     $[4] = value;

@@ -1,3 +1,103 @@
+/**
+ * ============================================================================
+ *  【文件总览】src/tools/AskUserQuestionTool/AskUserQuestionTool.tsx —— 交互式提问
+ * ============================================================================
+ *
+ *  【一句话定位】
+ *  让模型在**执行过程中**反过来向用户提选择题（2~4 个选项），
+ *  拿到答案后再继续干活。这是 Claude Code 里极特殊的一类工具：
+ *  别的工具是"模型指挥机器"，这个是"模型叫停、等人"。
+ *
+ *  【在架构中的位置】
+ *      主循环 src/query.ts 拿到模型的 tool_use: AskUserQuestion
+ *        ├─> validateInput()            检查 preview 字段格式
+ *        ├─> checkPermissions()         ★ 返回 'ask' → 弹出选择题界面
+ *        │     └─> 权限系统发现 requiresUserInteraction() === true
+ *        │         → 即使在 bypassPermissions 模式下**也必须**停下来问
+ *        │           （见 src/utils/permissions/permissions.ts 步骤 1e）
+ *        ├─> 用户在 UI 上选完 → 答案被写回 updatedInput.answers
+ *        ├─> call()                     ★ 只是把 answers 原样返回（真正的
+ *        │                                 交互发生在上面的 UI 环节）
+ *        └─> mapToolResultToToolResultBlockParam()
+ *              把答案拼成 "User has answered: "问题"="答案"…" 回灌模型
+ *
+ *  【★★ 核心难点：它是怎么"暂停"主循环的？】
+ *
+ *  乍看很反直觉：call() 里什么都没干，只是把入参里的 answers 原样返回。
+ *  那答案是哪来的？——**答案是在权限环节收集的**。
+ *
+ *  完整时序（这是理解本工具的关键）：
+ *
+ *   ① 模型发出 tool_use { questions: [...] }           ← 入参里**没有** answers
+ *   ② 主循环调 checkPermissions()
+ *   ③ 本文件固定返回 { behavior: 'ask', updatedInput: input }
+ *   ④ 权限系统看到 'ask' → 去弹出确认界面
+ *   ⑤ 又因为 requiresUserInteraction() 返回 true，这个 'ask' **不可被绕过**：
+ *      即使是 bypassPermissions / --dangerously-skip-permissions 模式，
+ *      permissions.ts 的步骤 1e 也会强制保留这个 ask，不会自动放行。
+ *      （这是本工具区别于普通权限弹窗的地方：普通弹窗在 bypass 模式下
+ *        会被自动允许，而这个不会——因为**没有人回答就没有结果**。）
+ *   ⑥ UI 层识别出这是 AskUserQuestion，渲染成**选择题界面**（不是普通的
+ *      允许/拒绝二选一弹窗），用户逐题选择、可勾多选、可写备注
+ *   ⑦ 用户提交后，UI 把结果 `{ "问题文本": "选中的标签" }` 写进
+ *      updatedInput.answers，工具**带着这份新输入再跑一次**
+ *   ⑧ 这一次 call() 拿到的 answers 就有内容了，原样包成 Output 返回
+ *   ⑨ mapToolResultToToolResultBlockParam 把它变成一句自然语言回给模型
+ *   ⑩ 主循环继续：模型读到了答案，接着干活
+ *
+ *  所以在第 ⑥ 步期间，整个 agent 循环是**真的停着的**——
+ *  它卡在 await 权限决策上，直到用户按键。这就是"暂停"的实现方式：
+ *  **不是什么特殊的挂起机制，而是借用了权限系统的 ask 分支 + 一个
+ *  "不可绕过"的标记**。
+ *
+ *  为什么要绕这一圈而不是直接在 call() 里读键盘？
+ *    · 复用：权限系统已经有成熟的 UI、hook、SDK 事件、非交互会话处理；
+ *    · 一致性：非交互会话（CI、SDK）里没有键盘可读，权限系统能统一
+ *      给出"无法交互"的错误，而不是卡死；
+ *    · 可审计：用户的选择和其它权限决策走同一条日志/事件通道。
+ *
+ *  【本文件包含什么】
+ *   1. questionOptionSchema / questionSchema / annotationsSchema  入参结构（zod）
+ *   2. UNIQUENESS_REFINE         校验"问题文本不重复、选项标签不重复"
+ *   3. AskUserQuestionResultMessage / _temp   结果消息的 React 组件
+ *   4. AskUserQuestionTool       buildTool({...}) 产出的工具对象（主体）
+ *   5. validateHtmlPreview()     preview 字段的 HTML 安全校验
+ *
+ *  【必须注意的几个约束（都写进了 schema 的 describe 里）】
+ *   · 1~4 个问题；每问 2~4 个选项（少于 2 个就不叫选择题了）
+ *   · **不要自己加 "Other" 选项**——UI 会自动提供
+ *   · header 是 ≤12 字符的小标签；问题文本必须唯一（因为它被当作
+ *     answers 的 **key**，重复会导致答案互相覆盖！）
+ *
+ *  【TS 语法速查】（本文件实际出现的）
+ *   - `.tsx` + JSX                 见 WebFetchTool/UI.tsx 的说明
+ *   - `feature('KAIROS')`          **编译期**常量，来自 `bun:bundle`。
+ *                                  打包时被替换成 true/false 并 tree-shaking 掉，
+ *                                  ≈ C 的 #ifdef，不是运行时 if
+ *   - `import { c as _c } from "react/compiler-runtime"`
+ *                                  React 编译器（Forget）生成的记忆化缓存 helper。
+ *                                  下面 `const $ = _c(3)` 是在申请 3 个缓存槽位，
+ *                                  用 `Symbol.for('react.memo_cache_sentinel')`
+ *                                  判断"这一槽还没存过东西"。
+ *                                  ≈ Java 里没有；可以理解为框架自动生成的
+ *                                  手写 memo 优化代码，**不是业务代码，不用深究**
+ *   - `z.record(z.string(), z.string())`   zod 的字典类型
+ *                                  ≈ Java 的 Map<String,String>；
+ *                                  本文件用它表示「问题文本 → 答案文本」的映射
+ *   - `z.strictObject({...}).refine(fn, { message })`
+ *                                  在字段校验之外追加**整体约束**。
+ *                                  ≈ Bean Validation 的类级别自定义注解
+ *   - `{ ...(annotations && { annotations }) }`
+ *                                  **条件展开**：annotations 为真才展开出这个字段，
+ *                                  为假就什么都不展开（避免出现 annotations: undefined）
+ *   - `answers = {}`               解构时的**默认值**（入参没给 answers 时用空对象）
+ *   - `answers?.[questionText]`    可选链 + 索引访问，缺省时得 undefined
+ *   - `as const`                   字面量类型收窄 + 只读
+ *   - `Object.entries(o).map(([k, v]) => ...)`  把对象转成 [键,值] 数组再映射
+ *                                  ≈ Java 的 map.entrySet().stream().map(...)
+ *   - `satisfies ToolDef<...>`     编译期契约检查但不擦除具体类型
+ * ============================================================================
+ */
 import { c as _c } from "react/compiler-runtime";
 import { feature } from 'bun:bundle';
 import * as React from 'react';

@@ -1,3 +1,105 @@
+/**
+ * 【一句话定位】★ 错误的「翻译与分类中心」：把 SDK / 网络 / 各云厂商抛出的原始错误，
+ *           翻译成①用户能看懂、知道该怎么办的提示消息；②供分析系统用的错误类别标签。
+ *
+ * 【在架构中的位置】
+ *   调用链：src/services/api/claude.ts（请求失败时）
+ *           → 本文件 getAssistantMessageFromError()（★ 生成给用户看的错误消息）
+ *           → 本文件 classifyAPIError()（★ 生成给分析系统看的类别标签）
+ *           → 本文件 categorizeRetryableAPIError()（给 SDK 用的粗分类）
+ *           → 本文件 isValidAPIMessage() / extractUnknownErrorFormat()（响应结构校验与兜底解析）
+ *   被调用方还有：
+ *     - src/query.ts（PROMPT_TOO_LONG_ERROR_MESSAGE / isPromptTooLongMessage）
+ *     - src/services/compact/*（getPromptTooLongTokenGap / isMediaSizeErrorMessage）
+ *     - src/services/api/logging.ts（classifyAPIError 结果随错误事件上报）
+ *     - src/services/api/withRetry.ts（REPEATED_529_ERROR_MESSAGE、shouldRetry 的补充）
+ *   依赖的下游模块：
+ *     - ../claudeAiLimits.js（限流文案生成）
+ *     - ./errorUtils.js（formatAPIError / extractConnectionErrorDetails）
+ *     - src/utils/messages.js（createAssistantAPIErrorMessage 构造错误消息对象）
+ *
+ * 【★ 错误分类体系：哪些可重试、哪些不可重试】
+ *   ⚠️ 注意分工：本文件**不决定**要不要重试（那是 withRetry.ts 的 shouldRetry），
+ *      本文件负责给错误贴标签、给人类可操作的文案。两者要对照着看。
+ *   按性质大致分几类：
+ *   ①**瞬时/容量类（通常可重试）**：
+ *       · api_timeout（连接超时）
+ *       · rate_limit（429 限流）
+ *       · server_overload（529 过载）/ repeated_529（连续过载）
+ *       · server_error（其它 5xx）
+ *       · connection_error / ssl_cert_error（网络层）
+ *   ②**鉴权类（先刷新凭证再重试，重试不成就要用户重新登录）**：
+ *       · authentication_failed / auth_error（401、403）
+ *       · invalid_api_key、token_revoked、oauth_org_not_allowed
+ *   ③**请求本身有问题（重试没用，必须改输入）**：
+ *       · prompt_too_long（提示词太长 → 触发压缩）
+ *       · pdf_too_large / pdf_password_protected / image_too_large（媒体超限）
+ *       · tool_use_mismatch / unexpected_tool_result / duplicate_tool_use_id
+ *         （工具调用配对被破坏 → 需要 /rewind 回滚）
+ *       · invalid_model / bedrock_model_access
+ *       · client_error（其它 4xx）
+ *   ④**账号/商务类（用户必须去处理）**：
+ *       · credit_balance_low（余额不足）、billing_error
+ *       · capacity_off_switch（Opus 限流的人工开关）
+ *   ⑤**模型拒绝**：refusal（内容违反使用政策，见 getErrorMessageIfRefusal）。
+ *
+ * 【本文件包含什么】
+ *   - 一堆错误消息常量（API_ERROR_MESSAGE_PREFIX、PROMPT_TOO_LONG_ERROR_MESSAGE、
+ *     INVALID_API_KEY_ERROR_MESSAGE、REPEATED_529_ERROR_MESSAGE 等）。
+ *   - startsWithApiErrorPrefix() / isPromptTooLongMessage() / isMediaSizeError(Message)()：判定函数。
+ *   - parsePromptTooLongTokenCounts() / getPromptTooLongTokenGap()：从错误文案里解析 token 数。
+ *   - getPdfTooLarge / getImageTooLarge / getRequestTooLarge 等一系列文案生成函数：
+ *     按「交互 / 非交互」给出不同的后续指引。
+ *   - isCCRMode() / logToolUseToolResultMismatch()：远程模式判定与排障日志。
+ *   - isValidAPIMessage() / extractUnknownErrorFormat()：响应结构校验。
+ *   - getAssistantMessageFromError()：★ 主入口（错误 → 用户可见消息）。
+ *   - get3PModelFallbackSuggestion()：三方渠道下推荐备用模型。
+ *   - classifyAPIError()：★ 错误 → 类别标签（供分析）。
+ *   - categorizeRetryableAPIError()：错误 → SDK 用的粗分类。
+ *   - getErrorMessageIfRefusal()：stop_reason 为 refusal 时的提示。
+ *
+ * 【TS 语法速查（本文件实际出现的）】
+ *   1. `export function isValidAPIMessage(value: unknown): value is BetaMessage`：
+ *      ★ **类型谓词（type predicate）**。返回值写成 `x is T` 表示：
+ *      「返回 true 就说明 value 是 T」。调用方写 `if (isValidAPIMessage(v))` 之后，
+ *      TS 会自动把 v 当成 BetaMessage 用，不需要 as 强转。
+ *      ≈ Java 的 `v instanceof T` + 自动向下转型（Java 16+ 的 pattern matching）。
+ *      ★ 这是 TS 相比 Java 的一个明显优势：可以自定义「类型守卫函数」。
+ *   2. `error instanceof APIConnectionTimeoutError`：跟 Java instanceof 完全一致。
+ *      本文件大量使用——因为要针对**不同的错误子类**给不同文案。
+ *   3. `error.message.toLowerCase().includes('prompt is too long')`：
+ *      ★ 靠**匹配错误文案**来识别错误类型。原注释里也承认这很脆弱（API 改措辞就失效），
+ *      但现实中各家 provider（尤其 Vertex/Bedrock）返回的错误形状千差万别，
+ *      只能这么兜。注意用 toLowerCase() 做大小写无关匹配（不同 provider 大小写不同）。
+ *   4. `return` 不带值：`function f(): X | undefined { if (...) return }` 等价于返回 undefined。
+ *      Java 里必须显式 `return null;`。
+ *   5. `match[1]!`：`!` 是★**非空断言**，告诉编译器「我确定它不是 null/undefined」。
+ *      ≈ Java 的强制解引用（运行时真的为空照样 NPE）。
+ *      因为 TS 严格模式下 match[1] 的类型是 string | undefined，而 parseInt 要 string。
+ *   6. `const match = /regex/.test(x)` / `x.match(/regex/)`：正则。
+ *      `/.../i` 的 i 是忽略大小写标志（Java：Pattern.CASE_INSENSITIVE）。
+ *      `[^0-9]*` 表示「任意多个非数字字符」—— 用来容忍文案里的各种前缀。
+ *   7. `error.headers?.get?.('...')`：
+ *      ★ 双重可选：headers 可能不存在，get 也可能不是函数（反序列化出来的对象）。
+ *      这在错误处理代码里很常见，因为错误对象的形状完全不可信。
+ *   8. `as 'five_hour' | 'seven_day' | ... | null`：把 string 断言成一个字面量联合，
+ *      这样后面赋值给 limits.rateLimitType 时类型才匹配。
+ *   9. `switch (msg.type) { case 'user': case 'assistant': {...} break; ... }`：
+ *      switch + case 穿透 + break，跟 Java 一模一样。
+ *      本文件用它对消息类型做穷举处理（配合 TS 的联合类型可以做穷尽性检查）。
+ *  10. `catch (_) { }`：用下划线命名一个不使用的 catch 参数（约定俗成）。
+ *  11. `const { source } = getAnthropicApiKeyWithSource()`：解构。
+ *  12. `template \`...${x}...\``：模板字符串，本文件几乎所有文案都靠它拼。
+ *      Java：String.format 或字符串拼接。
+ *  13. `MACRO.FEEDBACK_CHANNEL`：编译期宏（打包时替换成实际字符串）。
+ *  14. `export const X = '...'`：导出常量。TS 的字符串常量如果用 `as const` 或直接用字面量，
+ *      类型会被推断成字面量类型（这里是 string，因为没有 as const）。
+ *  15. `options?: { messages?: Message[] }`：可选对象参数，内部字段也可选。
+ *      调用时用 `options?.messages` 访问。
+ *  16. `Array.isArray(x)`：判断是不是数组（比 instanceof Array 更可靠，跨 realm 也行）。
+ *      Java：x instanceof List。
+ *  17. `content.some(block => block.type === 'text' && ...)`：some ≈ anyMatch。
+ */
 import {
   APIConnectionError,
   APIConnectionTimeoutError,
@@ -51,16 +153,23 @@ import {
 import { shouldProcessRateLimits } from '../rateLimitMocking.js' // Used for /mock-limits command
 import { extractConnectionErrorDetails, formatAPIError } from './errorUtils.js'
 
+// 所有面向用户的 API 错误文案统一以 'API Error' 开头，
+// 好处：①用户一眼认出这是 API 问题；②代码里可以用 startsWith 快速识别（见下）。
 export const API_ERROR_MESSAGE_PREFIX = 'API Error'
 
+// 判断一段文字是不是「API 错误」文案。第二种前缀是登录态失效时的提示格式。
 export function startsWithApiErrorPrefix(text: string): boolean {
   return (
     text.startsWith(API_ERROR_MESSAGE_PREFIX) ||
     text.startsWith(`Please run /login · ${API_ERROR_MESSAGE_PREFIX}`)
   )
 }
+// ★ 提示词过长。这是**常量字符串**而不是动态生成的，
+// 因为 UI（以及 compact 逻辑）要靠**精确匹配**这个串来识别，一改就全断了。
+// 教训：被程序逻辑依赖的用户可见文案，改动要非常谨慎。
 export const PROMPT_TOO_LONG_ERROR_MESSAGE = 'Prompt is too long'
 
+// 判断一条 assistant 消息是不是「提示词过长」的错误消息。
 export function isPromptTooLongMessage(msg: AssistantMessage): boolean {
   if (!msg.isApiErrorMessage) {
     return false
@@ -82,6 +191,10 @@ export function isPromptTooLongMessage(msg: AssistantMessage): boolean {
  * The raw string may be wrapped in SDK prefixes or JSON envelopes, or
  * have different casing (Vertex), so this is intentionally lenient.
  */
+// ★ 从原始错误文案里解析出「实际多少 token / 上限多少 token」。
+// 例子：prompt is too long: 137500 tokens > 135000 maximum
+// 正则里的 [^0-9]* 是刻意的宽容设计——SDK 可能加了前缀、可能套了 JSON，
+// Vertex 的大小写还不一样，所以只要能把两个数字抠出来就行。
 export function parsePromptTooLongTokenCounts(rawMessage: string): {
   actualTokens: number | undefined
   limitTokens: number | undefined
@@ -90,6 +203,7 @@ export function parsePromptTooLongTokenCounts(rawMessage: string): {
     /prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)/i,
   )
   return {
+// parseInt(match[1]!, 10)：`!` 非空断言（match 匹配成功时 [1] 必然存在）。
     actualTokens: match ? parseInt(match[1]!, 10) : undefined,
     limitTokens: match ? parseInt(match[2]!, 10) : undefined,
   }
@@ -101,6 +215,8 @@ export function parsePromptTooLongTokenCounts(rawMessage: string): {
  * Reactive compact uses this gap to jump past multiple groups in one retry
  * instead of peeling one-at-a-time.
  */
+// 算出「超了多少 token」。用途（注释里说了）：reactive compact 拿到这个差值，
+// 就能一次跳过足够多的历史分组，而不是一组一组慢慢剥——大幅减少重试轮次。
 export function getPromptTooLongTokenGap(
   msg: AssistantMessage,
 ): number | undefined {
@@ -130,6 +246,10 @@ export function getPromptTooLongTokenGap(
  * wording drift causes graceful degradation (errorDetails stays undefined,
  * caller short-circuits), not a false negative.
  */
+// ★ 判断是不是「媒体体积超限」类错误（图片太大 / PDF 页数太多）。
+// 用途：reactive compact 决定「能不能靠剥离图片来修复，要不要重试」。
+// 原注释特别提醒：这里的匹配模式必须与下面 getAssistantMessageFromError 里
+// 填充 errorDetails 的那几个分支**保持一致**，否则会出现「识别不出来」的漏网情况。
 export function isMediaSizeError(raw: string): boolean {
   return (
     (raw.includes('image exceeds') && raw.includes('maximum')) ||
@@ -151,6 +271,8 @@ export function isMediaSizeErrorMessage(msg: AssistantMessage): boolean {
     isMediaSizeError(msg.errorDetails)
   )
 }
+// ===== 以下是一批错误文案常量 ===== 
+// 之所以抽成常量，是因为多处（UI、日志、测试）都要引用，避免文案不一致。
 export const CREDIT_BALANCE_TOO_LOW_ERROR_MESSAGE = 'Credit balance is too low'
 export const INVALID_API_KEY_ERROR_MESSAGE = 'Not logged in · Please run /login'
 export const INVALID_API_KEY_ERROR_MESSAGE_EXTERNAL =
@@ -163,10 +285,17 @@ export const TOKEN_REVOKED_ERROR_MESSAGE =
   'OAuth token revoked · Please run /login'
 export const CCR_AUTH_ERROR_MESSAGE =
   'Authentication error · This may be a temporary network issue, please try again'
+// 连续 529 的文案（withRetry.ts 会用它构造 CannotRetryError）。
 export const REPEATED_529_ERROR_MESSAGE = 'Repeated 529 Overloaded errors'
+// Opus 过载时的人工降级开关文案：直接建议用户切到 Sonnet。
 export const CUSTOM_OFF_SWITCH_MESSAGE =
   'Opus is experiencing high load, please use /model to switch to Sonnet'
 export const API_TIMEOUT_ERROR_MESSAGE = 'Request timed out'
+// ★ 注意这一系列 get*ErrorMessage() 都做同一件事：
+// 根据「是不是非交互会话（`claude -p`）」给出不同的指引。
+//   交互模式：告诉用户「双击 esc 回去改一下」（有 UI 可操作）；
+//   非交互模式：告诉用户「用别的办法，比如先用 pdftotext 转成文本」。
+// 这是 CLI 工具很典型的文案适配——同样的错误，给人和给脚本的建议不同。
 export function getPdfTooLargeErrorMessage(): string {
   const limits = `max ${API_PDF_MAX_PAGES} pages, ${formatFileSize(PDF_TARGET_RAW_SIZE)}`
   return getIsNonInteractiveSession()
@@ -214,11 +343,16 @@ export function getOauthOrgNotAllowedErrorMessage(): string {
  * In CCR mode, auth is handled via JWTs provided by the infrastructure,
  * not via /login. Transient auth errors should suggest retrying, not logging in.
  */
+// CCR（Claude Code Remote）模式：鉴权由基础设施下发 JWT，不是用户 /login 来的。
+// 所以那里的鉴权错误多半是**瞬时故障**（网络抖动、鉴权服务抖动），
+// 应该提示「再试一次」而不是「去登录」。
 function isCCRMode(): boolean {
   return isEnvTruthy(process.env.CLAUDE_CODE_REMOTE)
 }
 
 // Temp helper to log tool_use/tool_result mismatch errors
+// 排障用的临时函数：把 tool_use / tool_result 配对错乱前后的消息序列打成字符串上报，
+// 便于在线上复现「到底是哪一步把配对搞坏了」。整体 try/catch 吞异常——排障代码不能影响主流程。
 function logToolUseToolResultMismatch(
   toolUseId: string,
   messages: Message[],
@@ -303,6 +437,8 @@ function logToolUseToolResultMismatch(
       const msg = messages[i]
       if (!msg) continue
 
+// switch 对消息类型做分类。TS 的联合类型 + switch 可以实现「穷尽性检查」：
+// 如果将来 Message 加了新类型而这里没处理，编译器（配合配置）能提醒。
       switch (msg.type) {
         case 'user':
         case 'assistant': {
@@ -384,8 +520,14 @@ function logToolUseToolResultMismatch(
 /**
  * Type guard to check if a value is a valid Message response from the API
  */
+// ★ 类型谓词函数：判断一个未知值是不是合法的 API 消息响应。
+// 为什么需要？因为响应可能是任何东西（HTML 错误页、null、结构不对的 JSON）。
+// 用了 `value is BetaMessage` 之后，调用方 if 里就能直接当 BetaMessage 用。
 export function isValidAPIMessage(value: unknown): value is BetaMessage {
   return (
+// `typeof value === 'object' && value !== null`：
+// ★ 必须同时判 null —— 因为 JS 里 typeof null === 'object'（历史 bug），
+// 只判 typeof 会把 null 也放进来。Java 的 instanceof 对 null 天然返回 false。
     typeof value === 'object' &&
     value !== null &&
     'content' in value &&
@@ -397,6 +539,7 @@ export function isValidAPIMessage(value: unknown): value is BetaMessage {
   )
 }
 
+// AWS 返回的错误结构（嵌套很深且形态特殊），单独定义一个类型来描述。
 /** Lower-level error that AWS can return. */
 type AmazonError = {
   Output?: {
@@ -408,6 +551,7 @@ type AmazonError = {
 /**
  * Given a response that doesn't look quite right, see if it contains any known error types we can extract.
  */
+// 兜底解析：响应「长得不对」时，试着从里面挖出已知的错误类型标识。
 export function extractUnknownErrorFormat(value: unknown): string | undefined {
   // Check if value is a valid object first
   if (!value || typeof value !== 'object') {
@@ -422,6 +566,11 @@ export function extractUnknownErrorFormat(value: unknown): string | undefined {
   return undefined
 }
 
+// ★★【主入口】把任意错误翻译成一条「给用户看的」assistant 错误消息。
+// 判断顺序是**从特殊到一般**：超时 → 图片/媒体 → 限流 → prompt 过长 → PDF → 
+// 工具配对 → 模型名 → 账单 → 鉴权 → 404 → 连接错误 → 兜底。
+// 每个分支都是 `error instanceof X && status === N && message.includes(...)` 三件套。
+// 返回值是 AssistantMessage：它会被插入会话历史，这样 Claude 自己也能看到刚才出了什么事。
 export function getAssistantMessageFromError(
   error: unknown,
   model: string,
@@ -431,6 +580,7 @@ export function getAssistantMessageFromError(
   },
 ): AssistantMessage {
   // Check for SDK timeout errors
+// ①超时：区分 SDK 的超时类型，以及「连接错误但消息里含 timeout」的情况。
   if (
     error instanceof APIConnectionTimeoutError ||
     (error instanceof APIConnectionError &&
@@ -445,12 +595,14 @@ export function getAssistantMessageFromError(
   // Check for image size/resize errors (thrown before API call during validation)
   // Use getImageTooLargeErrorMessage() to show "esc esc" hint for CLI users
   // but a generic message for SDK users (non-interactive mode)
+// ②图片体积/缩放错误：这是在**发请求之前**的校验阶段就抛的（不是服务端返回的）。
   if (error instanceof ImageSizeError || error instanceof ImageResizeError) {
     return createAssistantAPIErrorMessage({
       content: getImageTooLargeErrorMessage(),
     })
   }
 
+// ③Opus 的人工限流开关：归类成 rate_limit。
   // Check for emergency capacity off switch for Opus PAYG users
   if (
     error instanceof Error &&
@@ -462,12 +614,16 @@ export function getAssistantMessageFromError(
     })
   }
 
+// ④429 限流 —— 本文件最复杂的一段。
+// 先读服务端新版的「统一限流」响应头，判断是哪种限流（5 小时窗 / 7 天窗 / Opus 7 天窗）、
+// 超额用量（overage）是否可用、什么时候重置，然后交给 getRateLimitErrorMessage 生成精准文案。
   if (
     error instanceof APIError &&
     error.status === 429 &&
     shouldProcessRateLimits(isClaudeAISubscriber())
   ) {
     // Check if this is the new API with multiple rate limit headers
+// `error.headers?.get?.(...)`：双重可选（headers 可能没有、get 可能不是函数）。
     const rateLimitType = error.headers?.get?.(
       'anthropic-ratelimit-unified-representative-claim',
     ) as 'five_hour' | 'seven_day' | 'seven_day_opus' | null
@@ -524,6 +680,9 @@ export function getAssistantMessageFromError(
         })
       }
 
+// ★ 值得注意的返回值：NO_RESPONSE_REQUESTED。
+// 含义：这次限流**不展示**任何错误给用户，因为后台会自动降级（比如 Opus → Sonnet）；
+// 但仍然要把这条消息记进会话历史，让 Claude 知道发生过什么。
       // If getRateLimitErrorMessage returned null, it means the fallback mechanism
       // will handle this silently (e.g., Opus -> Sonnet fallback for eligible users).
       // Return NO_RESPONSE_REQUESTED so no error is shown to the user, but the
@@ -534,6 +693,8 @@ export function getAssistantMessageFromError(
       })
     }
 
+// 没有限流头 → 说明**不是**配额问题，而是别的 429（比如权益校验失败、基础设施容量）。
+// 这时不能笼统说「触发限流」，而要把服务端真正的说法展示出来。
     // No quota headers — this is NOT a quota limit. Surface what the API actually
     // said instead of a generic "Rate limit reached". Entitlement rejections
     // (e.g. 1M context without Extra Usage) and infra capacity 429s land here.
@@ -546,6 +707,8 @@ export function getAssistantMessageFromError(
         error: 'rate_limit',
       })
     }
+// SDK 在没有顶层 message 时会把整个 body JSON 化并加上 '429 ' 前缀，
+// 所以这里要把前缀剥掉、再从 JSON 里抠出内层 message。
     // SDK's APIError.makeMessage prepends "429 " and JSON-stringifies the body
     // when there's no top-level .message — extract the inner error.message.
     const stripped = error.message.replace(/^429\s+/, '')
@@ -557,6 +720,10 @@ export function getAssistantMessageFromError(
     })
   }
 
+// ⑤prompt 过长。注意 Vertex 返回 413、直连 API 返回 400，所以这里只看文案不看状态码；
+// 而且大小写不同（用 toLowerCase 抹平）。
+// ★ content 保持通用文案（UI 靠精确匹配识别），真实的 token 数放进 errorDetails，
+//   供 reactive compact 解析「超了多少」。这是一个很好的「展示与数据分离」设计。
   // Handle prompt too long errors (Vertex returns 413, direct API returns 400)
   // Use case-insensitive check since Vertex returns "Prompt is too long" (capitalized)
   if (
@@ -574,6 +741,7 @@ export function getAssistantMessageFromError(
   }
 
   // Check for PDF page limit errors
+// ⑥PDF 页数超限（用正则匹配「maximum of N PDF pages」，因为 N 是变量）。
   if (
     error instanceof Error &&
     /maximum of \d+ PDF pages/.test(error.message)
@@ -596,6 +764,9 @@ export function getAssistantMessageFromError(
     })
   }
 
+// ⑦无效 PDF（比如把 HTML 改名成 .pdf）。
+// ★ 注释点出了这个分支的价值：如果不处理，这个坏 PDF 块会**一直留在上下文里**，
+// 导致之后**每一次** API 调用都 400 —— 一个坏输入把整个会话废掉。
   // Check for invalid PDF errors (e.g., HTML file renamed to .pdf)
   // Without this handler, invalid PDF document blocks persist in conversation
   // context and cause every subsequent API call to fail with 400.
@@ -622,6 +793,7 @@ export function getAssistantMessageFromError(
     })
   }
 
+// ⑧多图请求时尺寸限制更严（2000px），单独给一条更明确的指引（建议 /compact 清掉旧图）。
   // Check for many-image dimension errors (API enforces stricter 2000px limit for many-image requests)
   if (
     error instanceof APIError &&
@@ -638,6 +810,9 @@ export function getAssistantMessageFromError(
     })
   }
 
+// ⑨auto mode 的 beta 头被拒（套餐不含该功能）。
+// ★ AFK_MODE_BETA_HEADER 在外部构建里是空字符串，靠 `AFK_MODE_BETA_HEADER &&` 这个真值判断
+// 让整段在非目标构建中失效（相当于编译期裁剪的运行时兜底）。
   // Server rejected the afk-mode beta header (plan does not include auto
   // mode). AFK_MODE_BETA_HEADER is '' in non-TRANSCRIPT_CLASSIFIER builds,
   // so the truthy guard keeps this inert there.
@@ -654,6 +829,7 @@ export function getAssistantMessageFromError(
     })
   }
 
+// ⑩413 请求体太大（典型：大 PDF + 长会话超过 32MB 上限）。
   // Check for request too large errors (413 status)
   // This typically happens when a large PDF + conversation context exceeds the 32MB API limit
   if (error instanceof APIError && error.status === 413) {
@@ -663,6 +839,8 @@ export function getAssistantMessageFromError(
     })
   }
 
+// ⑪tool_use 后面没有紧跟 tool_result —— 会话历史被破坏了。
+// 处理：先上报排障日志，再给用户一条「用 /rewind 回滚」的恢复指引（避免死锁）。
   // Check for tool_use/tool_result concurrency error
   if (
     error instanceof APIError &&
@@ -684,6 +862,7 @@ export function getAssistantMessageFromError(
       }
     }
 
+// 内部用户能看到更详细的信息（含去反馈频道的指引），外部用户只看到概括提示。
     if (process.env.USER_TYPE === 'ant') {
       const baseMessage = `API Error: 400 ${error.message}\n\nRun /share and post the JSON file to ${MACRO.FEEDBACK_CHANNEL}.`
       const rewindInstruction = getIsNonInteractiveSession()
@@ -713,6 +892,8 @@ export function getAssistantMessageFromError(
     logEvent('tengu_unexpected_tool_result', {})
   }
 
+// ⑫重复的 tool_use id。注释说明：发送前已有逻辑会剥离这类问题，
+// 所以能走到这里说明出了**新的**损坏路径 —— 必须上报以便定位根因。
   // Duplicate tool_use IDs (CC-1212). ensureToolResultPairing strips these
   // before send, so hitting this means a new corruption path slipped through.
   // Log for root-causing, and give users a recovery path instead of deadlock.
@@ -732,6 +913,8 @@ export function getAssistantMessageFromError(
     })
   }
 
+// ⑬订阅用户用了 Opus 但套餐不支持（Pro 计划没有 Opus）。
+// 提示里特意提到「刚升级过订阅就先 /logout 再 /login」，因为订阅信息是登录时缓存的。
   // Check for invalid model name error for subscription users trying to use Opus
   if (
     isClaudeAISubscriber() &&
@@ -747,6 +930,8 @@ export function getAssistantMessageFromError(
     })
   }
 
+// 内部用户（ant）的专属分支：可能是组织没被加进模型白名单，
+// 提示里直接给出 orgId，方便去反馈频道求助。
   // Check for invalid model name error for Ant users. Claude Code may be
   // defaulting to a custom internal-only model for Ants, and there might be
   // Ants using new or unknown org IDs that haven't been gated in.
@@ -778,6 +963,9 @@ export function getAssistantMessageFromError(
       error: 'billing_error',
     })
   }
+// ⑭「组织已被禁用」。最常见的原因（注释里说了）：环境变量里还留着**上一家**的
+// ANTHROPIC_API_KEY，把订阅鉴权给盖掉了。
+// 只处理「确实是环境变量来源」的情况——其它来源说明当前组织真的被禁了，没法靠改配置救。
   // "Organization has been disabled" — commonly a stale ANTHROPIC_API_KEY
   // from a previous employer/project overriding subscription auth. Only handle
   // the env-var case; apiKeyHelper and /login-managed keys mean the active
@@ -792,12 +980,19 @@ export function getAssistantMessageFromError(
     // under the same source value, and in CCR mode OAuth stays active despite
     // the env var. The three guards ensure we only blame the env var when it's
     // actually set and actually on the wire.
+// 三重校验确保「确实是该环境变量在起作用」（源码注释解释了原因：
+// getAnthropicApiKeyWithSource 会把环境变量和 FD 传来的 key 归为同一来源，
+// 而 CCR 模式下即使有环境变量 OAuth 也仍然生效）。
     if (
       source === 'ANTHROPIC_API_KEY' &&
       process.env.ANTHROPIC_API_KEY &&
       !isClaudeAISubscriber()
     ) {
       const hasStoredOAuth = getClaudeAIOAuthTokens()?.accessToken != null
+// ★ 分类特意**不用** authentication_failed：因为那会触发 VS Code 弹出登录，
+// 而登录根本解决不了这个问题（环境变量会继续覆盖 OAuth）。
+// 正确解法是「改配置（unset 环境变量）」，所以归为 invalid_request。
+// 教训：错误分类不只是标签，它会**驱动**具体行为，选错会让用户走进死路。
       // Not 'authentication_failed' — that triggers VS Code's showLogin(), but
       // login can't fix this (approved env var keeps overriding OAuth). The fix
       // is configuration-based (unset the var), so invalid_request is correct.
@@ -810,6 +1005,7 @@ export function getAssistantMessageFromError(
     }
   }
 
+// ⑮API key 无效。CCR 模式下当成瞬时网络问题；否则按来源区分是「外部 key」还是「登录态」。
   if (
     error instanceof Error &&
     error.message.toLowerCase().includes('x-api-key')
@@ -835,6 +1031,7 @@ export function getAssistantMessageFromError(
     })
   }
 
+// ⑯OAuth token 被吊销（别的进程刷新过，本地这份作废）。
   // Check for OAuth token revocation error
   if (
     error instanceof APIError &&
@@ -847,6 +1044,7 @@ export function getAssistantMessageFromError(
     })
   }
 
+// ⑰组织不允许 OAuth 登录。
   // Check for OAuth organization not allowed error
   if (
     error instanceof APIError &&
@@ -861,6 +1059,7 @@ export function getAssistantMessageFromError(
     })
   }
 
+// 其它 401/403 的兜底：CCR 模式提示重试，否则提示 /login。
   // Generic handler for other 401/403 authentication errors
   if (
     error instanceof APIError &&
@@ -882,6 +1081,8 @@ export function getAssistantMessageFromError(
     })
   }
 
+// Bedrock 的「没有该模型的访问权限」——错误信息里不含具体模型 ID，
+// 所以这里自己把模型名拼进去，并建议一个可用的备选模型。
   // Bedrock errors like "403 You don't have access to the model with the specified model ID."
   // don't contain the actual model ID
   if (
@@ -899,6 +1100,7 @@ export function getAssistantMessageFromError(
     })
   }
 
+// 404：模型不存在 / 没开通。引导用户用 /model 换一个。
   // 404 Not Found — usually means the selected model doesn't exist or isn't
   // available. Guide the user to /model so they can pick a valid one.
   // For 3P users, suggest a specific fallback model they can try.
@@ -914,6 +1116,8 @@ export function getAssistantMessageFromError(
   }
 
   // Connection errors (non-timeout) — use formatAPIError for detailed messages
+// 连接错误（非超时）：交给 errorUtils 的 formatAPIError 生成详细文案
+// （那里会把 SSL / 代理之类的问题翻译成可操作的建议）。
   if (error instanceof APIConnectionError) {
     return createAssistantAPIErrorMessage({
       content: `${API_ERROR_MESSAGE_PREFIX}: ${formatAPIError(error)}`,
@@ -921,6 +1125,7 @@ export function getAssistantMessageFromError(
     })
   }
 
+// 最后两层兜底：普通 Error → 带上 message；非 Error（比如字符串）→ 只给通用前缀。
   if (error instanceof Error) {
     return createAssistantAPIErrorMessage({
       content: `${API_ERROR_MESSAGE_PREFIX}: ${error.message}`,
@@ -937,6 +1142,9 @@ export function getAssistantMessageFromError(
  * For 3P users, suggest a fallback model when the selected model is unavailable.
  * Returns a model name suggestion, or undefined if no suggestion is applicable.
  */
+// 给三方渠道（Bedrock/Vertex）用户推荐一个「大概率可用」的备选模型：
+// Opus 4.6 → 4.1，Sonnet 4.6 → 4.5，Sonnet 4.5 → 4.0（逐级降级）。
+// 第一方用户直接返回 undefined（不需要这个建议）。
 function get3PModelFallbackSuggestion(model: string): string | undefined {
   if (getAPIProvider() === 'firstParty') {
     return undefined
@@ -958,11 +1166,16 @@ function get3PModelFallbackSuggestion(model: string): string | undefined {
   return undefined
 }
 
+// ★★【第二个主入口】把错误归类成一个字符串标签，供分析系统（Datadog / BigQuery）统计。
+// 判断顺序同样是「从特殊到一般」，最后按状态码兜底。
+// 注意它与 getAssistantMessageFromError 的判定条件要保持一致——
+// 两边对同一个错误的认定必须吻合，否则统计口径会跟用户看到的对不上。
 /**
  * Classifies an API error into a specific error type for analytics tracking.
  * Returns a standardized error type string suitable for Datadog tagging.
  */
 export function classifyAPIError(error: unknown): string {
+// 用户主动取消：不算错误，单独一类（避免污染错误率统计）。
   // Aborted requests
   if (error instanceof Error && error.message === 'Request was aborted.') {
     return 'aborted'
@@ -1141,6 +1354,7 @@ export function classifyAPIError(error: unknown): string {
     return 'bedrock_model_access'
   }
 
+// 按状态码兜底：5xx → server_error，4xx → client_error。
   // Status code based fallbacks
   if (error instanceof APIError) {
     const status = error.status
@@ -1148,6 +1362,8 @@ export function classifyAPIError(error: unknown): string {
     if (status >= 400) return 'client_error'
   }
 
+// 连接错误还要再细分：如果是 SSL/TLS 证书问题，单独标成 ssl_cert_error，
+// 因为这类问题在企业网络里非常普遍，值得单独统计与告警。
   // Connection errors - check for SSL/TLS issues first
   if (error instanceof APIConnectionError) {
     const connectionDetails = extractConnectionErrorDetails(error)
@@ -1160,6 +1376,7 @@ export function classifyAPIError(error: unknown): string {
   return 'unknown'
 }
 
+// 给 SDK 对外暴露的粗分类（字段更少），用于 SDK 调用方判断大致的失败原因。
 export function categorizeRetryableAPIError(
   error: APIError,
 ): SDKAssistantMessageError {
@@ -1181,6 +1398,9 @@ export function categorizeRetryableAPIError(
   return 'unknown'
 }
 
+// ★ stop_reason === 'refusal'：模型**拒绝**回答（认为请求违反使用政策）。
+// 这不是 HTTP 错误，而是模型正常返回但拒绝作答，所以要单独处理。
+// 顺带上报一条 tengu_refusal_api_response 事件用于监控拒绝率。
 export function getErrorMessageIfRefusal(
   stopReason: BetaStopReason | null,
   model: string,
@@ -1191,6 +1411,7 @@ export function getErrorMessageIfRefusal(
 
   logEvent('tengu_refusal_api_response', {})
 
+// 同样按「交互 / 非交互」给出不同的后续指引（双击 esc 编辑上一条消息 vs 换个思路重来）。
   const baseMessage = getIsNonInteractiveSession()
     ? `${API_ERROR_MESSAGE_PREFIX}: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Try rephrasing the request or attempting a different approach.`
     : `${API_ERROR_MESSAGE_PREFIX}: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Please double press esc to edit your last message or start a new session for Claude Code to assist with a different task.`

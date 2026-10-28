@@ -1,3 +1,61 @@
+/**
+ * ============================================================================
+ *  【文件总览】src/tools/WebSearchTool/UI.tsx —— WebSearch 的终端界面渲染层
+ * ============================================================================
+ *
+ *  【一句话定位】
+ *  四个渲染函数，把 WebSearch 的「调用中 / 搜索中 / 已完成」三种状态画到终端上。
+ *  不搜任何东西，只做展示。
+ *
+ *  【在架构中的位置】
+ *      主循环执行 WebSearchTool
+ *        ├─ 工具被调用        → renderToolUseMessage()        ← ★ 本文件
+ *        ├─ 流式进度上报      → renderToolUseProgressMessage() ← ★ 本文件
+ *        │     （WebSearchTool.ts 的 onProgress 回调会喂数据进来）
+ *        ├─ 搜索完成          → renderToolResultMessage()     ← ★ 本文件
+ *        └─ 侧边栏单行摘要    → getToolUseSummary()           ← ★ 本文件
+ *
+ *  【本文件包含什么】
+ *   1. getSearchSummary()              数一数 results 里有几次搜索、共几条链接
+ *   2. renderToolUseMessage()          "xxx"（verbose 时附带域名过滤条件）
+ *   3. renderToolUseProgressMessage()  按进度类型显示"正在搜 xxx"/"找到 N 条"
+ *   4. renderToolResultMessage()       "Did 2 searches in 1.2s"
+ *   5. getToolUseSummary()             截断后的搜索词
+ *
+ *  【★ 值得注意：进度渲染是怎么工作的】
+ *  WebSearchTool.ts 在流式消费时会调 onProgress 上报两类进度：
+ *      { type: 'query_update',          query }         —— 模型决定要去搜这个词了
+ *      { type: 'search_results_received', resultCount, query } —— 这一轮搜到 N 条
+ *  这里只取**最后一条**进度来显示（progressMessages[length-1]），
+ *  因为终端只有一行进度位，画历史没有意义——只画"现在在干嘛"。
+ *
+ *  【TS / React 语法速查】（本文件实际出现的）
+ *   - `.tsx` + JSX：`<Text dimColor>xxx</Text>` 这种"在 JS 里写标签"的语法。
+ *     ≈ Java 里没有；可以理解为编译成函数调用的表达式
+ *   - `React.ReactNode` 返回类型：可渲染物（JSX / 字符串 / null 都行）
+ *   - `(SearchResult | string | null | undefined)[]`
+ *                                联合类型数组。为什么会有 null？
+ *                                因为结果可能经过 JSON 往返（压缩/反序列化），
+ *                                中间会掺进 null。所以必须判空
+ *   - `result != null`           用 `!=`（不是 `!==`）一次性排除 null 和 undefined
+ *                                （JS 特有意行为；Java 没有这套）
+ *   - `typeof result !== 'string'` 运行时类型判断
+ *                                ≈ Java 的 `!(result instanceof String)`
+ *   - `result.content?.length ?? 0`  可选链 + 空值合并连用：
+ *                                "content 可能为 undefined，取 length 也可能
+ *                                 undefined，那就用 0"。⚠️ 注意这里用 `??`
+ *                                 而不是 `||`，因为 length 为 0 是**合法值**，
+ *                                 不能被替换掉
+ *   - `switch (data.type) { ... }`  对可辨识联合做分支；TS 会自动收窄每个 case
+ *                                ≈ Java 17+ 的 sealed interface 模式匹配
+ *   - `&quot;`                   JSX 里写双引号要用 HTML 实体，
+ *                                因为直接写 " 会和 JSX 属性引号冲突
+ *   - `{searchCount !== 1 ? 'es' : ''}`  JSX 里的大括号 = JS 表达式。
+ *                                这里做单复数处理（1 search / 2 searches）
+ *   - `width="100%"` / `justifyContent="space-between"`  ink 的 flex 布局属性
+ *   - 文件末尾 `//# sourceMappingURL=...` 是构建产物留下的源映射，别动
+ * ============================================================================
+ */
 import React from 'react';
 import { MessageResponse } from '../../components/MessageResponse.js';
 import { TOOL_SUMMARY_MAX_LENGTH } from '../../constants/toolLimits.js';
@@ -5,6 +63,21 @@ import { Box, Text } from '../../ink.js';
 import type { ProgressMessage } from '../../types/message.js';
 import { truncate } from '../../utils/format.js';
 import type { Output, SearchResult, WebSearchProgress } from './WebSearchTool.js';
+/**
+ * 统计 results[] 里有几次搜索、一共几条链接。
+ *
+ * 【做什么】遍历 results，只统计"对象类型"的条目（跳过字符串条目，
+ *          因为字符串是模型说的话，不是一次搜索）。
+ * 【为什么需要】结果行要显示 "Did 2 searches" —— 需要知道**搜索次数**；
+ *              而一次搜索对应一个 SearchResult 对象，所以数对象就够了。
+ * 【入参】results  混合数组（SearchResult 对象 | 字符串 | null | undefined）
+ * 【返回】{ searchCount, totalResultCount }
+ * 【关键步骤】
+ *   ① `result != null` 排除 null 和 undefined（用 != 而非 !== 是 JS 惯用技巧，
+ *      一个判断同时覆盖两种空值）
+ *   ② `typeof result !== 'string'` 排除文字段，剩下的就是链接组
+ *   ③ 累加 content 数组的长度；`?.` + `??` 保证 content 缺失时按 0 算
+ */
 function getSearchSummary(results: (SearchResult | string | null | undefined)[]): {
   searchCount: number;
   totalResultCount: number;
@@ -22,6 +95,19 @@ function getSearchSummary(results: (SearchResult | string | null | undefined)[])
     totalResultCount
   };
 }
+/**
+ * 渲染「工具被调用」这一刻的一行字。
+ *
+ * 【做什么】显示带引号的搜索词；verbose 模式下再补上域名过滤条件。
+ * 【为什么需要】让用户看到"模型要去搜什么"——这是观察模型行为的重要窗口，
+ *              也能及时发现搜索词被改写得不对（比如年份写错了）。
+ * 【入参】第一个参数解构出 query / allowed_domains / blocked_domains（Partial）；
+ *        第二个参数 { verbose }
+ * 【返回】字符串，或 null（query 还没到就不画）
+ * 【注意】开头 `if (!query) return null` 之后又 `if (query)` 再判一次，
+ *        看着重复，但前者是为了让 TS 收窄类型（去掉 undefined），
+ *        后者是给后续拼接用的——这类"防御性重复"在流式参数场景很常见。
+ */
 export function renderToolUseMessage({
   query,
   allowed_domains,
@@ -52,6 +138,22 @@ export function renderToolUseMessage({
   }
   return message;
 }
+/**
+ * 渲染「正在搜索中」的进度行（随流式进度不断更新）。
+ *
+ * 【做什么】取最后一条进度消息，按它的 type 画一行：
+ *      query_update           → "Searching: xxx"
+ *      search_results_received → "Found N results for "xxx""
+ *      其它                    → 什么都不画
+ * 【为什么只取最后一条】终端只有一行进度位，画历史没有意义，
+ *                      只显示"此刻在做什么"即可。
+ * 【为什么有这么多判空】进度消息可能在任何时刻到达，也可能一条都没有；
+ *                      data 字段也可能缺失。渲染层必须"怎么都不会崩"。
+ * 【入参】progressMessages  到目前为止收到的进度消息数组
+ * 【返回】JSX 或 null
+ * 【语法】`&quot;` 是 HTML 实体，在 JSX 文本里写双引号要用它，
+ *        否则会和 JSX 的属性引号打架
+ */
 export function renderToolUseProgressMessage(progressMessages: ProgressMessage<WebSearchProgress>[]): React.ReactNode {
   if (progressMessages.length === 0) {
     return null;
@@ -76,6 +178,20 @@ export function renderToolUseProgressMessage(progressMessages: ProgressMessage<W
       return null;
   }
 }
+/**
+ * 渲染「搜索完成」的结果行。
+ *
+ * 【做什么】显示 "Did 2 searches in 1.2s"（耗时 ≥1 秒用秒，否则用毫秒）。
+ * 【为什么只显示次数和耗时、不显示链接】
+ *   因为链接已经全部交给**模型**了（在 tool_result 里），
+ *   终端上再刷一遍会占用大量屏幕。这里只给用户一个"干完了、花了多久"的交代。
+ *   （这也正是 WebSearchTool.extractSearchText() 返回空字符串的原因：
+ *     没显示过的内容不该参与界面搜索，否则会出现幽灵匹配。）
+ * 【入参】output（含 results 和 durationSeconds）
+ * 【返回】JSX：一行两端对齐的文本
+ * 【语法】`{searchCount !== 1 ? 'es' : ''}` 是 JSX 里嵌 JS 表达式做单复数。
+ *        注意 JSX 中大括号 `{}` 内是**表达式**不是语句
+ */
 export function renderToolResultMessage(output: Output): React.ReactNode {
   const {
     searchCount
@@ -90,6 +206,16 @@ export function renderToolResultMessage(output: Output): React.ReactNode {
       </MessageResponse>
     </Box>;
 }
+/**
+ * 生成一行简短摘要（给侧边栏、活动状态等"只放得下一行"的地方用）。
+ *
+ * 【做什么】把搜索词截断后返回；没有搜索词就返回 null。
+ * 【为什么需要】和 renderToolUseMessage 的区别：返回的是**纯字符串**而不是
+ *              React 节点，方便调用方拼进日志、状态栏、遥测。
+ * 【入参】input 可能整个是 undefined（故类型写成 `... | undefined`，
+ *        并用 `input?.query` 可选链取值）
+ * 【返回】string | null
+ */
 export function getToolUseSummary(input: Partial<{
   query: string;
 }> | undefined): string | null {

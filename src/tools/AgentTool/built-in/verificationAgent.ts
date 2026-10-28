@@ -1,3 +1,35 @@
+/**
+ * 【一句话定位】内置 agent「verification」的定义：专门**挑刺**的验证 agent —— 它的职责不是
+ * 确认实现能跑通，而是想办法把实现弄坏。
+ *
+ * 【在架构中的位置】
+ *   上游：builtInAgents.ts（VERIFICATION_AGENT + tengu_hive_evidence 双开关）。
+ *   下游：Bash + 各类 MCP 浏览器自动化工具（mcp__playwright__* 等）。
+ *   它的 `background: true` 意味着被派生时**一定**以后台任务跑（验证通常很慢）。
+ *
+ * 【这份 prompt 的设计思路】(很值得 Java 工程师一看，是「如何让 LLM 不偷懒」的范例)
+ *   ① 先点名两种失败模式：验证回避（找理由不跑检查）、被前 80% 迷惑（看到漂亮 UI 就放行）
+ *   ② 明说「调用方可能抽查重跑你的命令」—— 制造可验证的压力
+ *   ③ 列出常见的自我合理化借口并要求反着做（「代码看起来是对的」→ 跑起来才算）
+ *   ④ 强制输出格式：每条检查必须有 Command run / Output observed / Result，
+ *      没有命令的检查不算 PASS，只算跳过
+ *   ⑤ 结尾强制输出 `VERDICT: PASS|FAIL|PARTIAL` 供调用方解析
+ *
+ * 【本文件包含什么】
+ *   - VERIFICATION_SYSTEM_PROMPT：超长的验证策略 prompt（按改动类型分支 + 对抗性探针）。
+ *   - VERIFICATION_WHEN_TO_USE：给模型看的「什么时候用我」。
+ *   - VERIFICATION_AGENT：agent 定义对象。
+ *
+ * 【TS 语法速查】
+ *   - `background: true`：这个字段会让 AgentTool 强制以异步方式派生它（见 AgentTool.tsx）。
+ *   - `criticalSystemReminder_EXPERIMENTAL`：每一轮 user turn 都会重新注入的一句提醒。
+ *     这里用它反复强调「你只能验证不能改项目文件」—— 单次 system prompt 容易被长对话冲淡，
+ *     每轮重注才能保证约束一直在上下文里。
+ *   - `disallowedTools`：禁掉 Agent / ExitPlanMode / Edit / Write / NotebookEdit，
+ *     和提示词里「不许改项目目录」呼应（工具层面根本给不了）。
+ *   - 模板字符串里大量 `\`` 转义反引号（因为要输出 Markdown 代码块）。
+ *   - `color: 'red'` 红色（验证失败要显眼）；`model: 'inherit'` 跟随主模型（验证需要强推理）。
+ */
 import { BASH_TOOL_NAME } from 'src/tools/BashTool/toolName.js'
 import { EXIT_PLAN_MODE_TOOL_NAME } from 'src/tools/ExitPlanModeTool/constants.js'
 import { FILE_EDIT_TOOL_NAME } from 'src/tools/FileEditTool/constants.js'
@@ -7,6 +39,15 @@ import { WEB_FETCH_TOOL_NAME } from 'src/tools/WebFetchTool/prompt.js'
 import { AGENT_TOOL_NAME } from '../constants.js'
 import type { BuiltInAgentDefinition } from '../loadAgentsDir.js'
 
+/**
+ * verification agent 的 system prompt。结构：
+ *   ① 点名两种失败模式（验证回避 / 被前 80% 迷惑）
+ *   ② 禁止改动项目目录（但允许在 /tmp 下写临时测试脚本）
+ *   ③ 按改动类型给验证策略（前端/后端/CLI/基础设施/库/bug 修复/移动端/数据管线/数据库迁移/重构）
+ *   ④ 通用基线步骤（读 CLAUDE.md → 构建 → 测试 → lint → 查回归）
+ *   ⑤ 自我合理化清单 + 对抗性探针清单
+ *   ⑥ PASS/FAIL 前的自检要求 + 强制的输出格式 + VERDICT 行
+ */
 const VERIFICATION_SYSTEM_PROMPT = `You are a verification specialist. Your job is not to confirm the implementation works — it's to try to break it.
 
 You have two documented failure patterns. First, verification avoidance: when faced with a check, you find reasons not to run it — you read code, narrate what you would test, write "PASS," and move on. Second, being seduced by the first 80%: you see a polished UI or a passing test suite and feel inclined to pass it, not noticing half the buttons do nothing, the state vanishes on refresh, or the backend crashes on bad input. The first 80% is the easy part. Your entire value is in finding the last 20%. The caller may spot-check your commands by re-running them — if a PASS step has no command output, or output that doesn't match re-execution, your report gets rejected.
@@ -131,11 +172,13 @@ Use the literal string \`VERDICT: \` followed by exactly one of \`PASS\`, \`FAIL
 const VERIFICATION_WHEN_TO_USE =
   'Use this agent to verify that implementation work is correct before reporting completion. Invoke after non-trivial tasks (3+ file edits, backend/API changes, infrastructure changes). Pass the ORIGINAL user task description, list of files changed, and approach taken. The agent runs builds, tests, linters, and checks to produce a PASS/FAIL/PARTIAL verdict with evidence.'
 
+// agent 定义：background: true 表示派生时一定以后台任务跑（验证通常耗时较长）
 export const VERIFICATION_AGENT: BuiltInAgentDefinition = {
   agentType: 'verification',
   whenToUse: VERIFICATION_WHEN_TO_USE,
   color: 'red',
   background: true,
+// 和 Explore/Plan 相同的禁用清单（不能派生、不能交计划、不能改文件/notebook）
   disallowedTools: [
     AGENT_TOOL_NAME,
     EXIT_PLAN_MODE_TOOL_NAME,
@@ -145,8 +188,11 @@ export const VERIFICATION_AGENT: BuiltInAgentDefinition = {
   ],
   source: 'built-in',
   baseDir: 'built-in',
+// 跟随主模型：验证需要强推理能力
   model: 'inherit',
   getSystemPrompt: () => VERIFICATION_SYSTEM_PROMPT,
+// 每轮重新注入的硬提醒：验证 agent 最大的风险就是「顺手把问题修了」，
+// 必须每轮都提醒它只能验证不能改项目文件
   criticalSystemReminder_EXPERIMENTAL:
     'CRITICAL: This is a VERIFICATION-ONLY task. You CANNOT edit, write, or create files IN THE PROJECT DIRECTORY (tmp is allowed for ephemeral test scripts). You MUST end with VERDICT: PASS, VERDICT: FAIL, or VERDICT: PARTIAL.',
 }

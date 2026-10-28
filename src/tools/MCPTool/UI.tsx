@@ -1,3 +1,189 @@
+/**
+ * ============================================================================
+ *  【文件总览】src/tools/MCPTool/UI.tsx —— MCP 工具的输出怎么画到终端
+ * ============================================================================
+ *
+ *  ★★ 读前须知：本文件是 React Compiler 的**编译产物** ★★
+ *
+ *  证据：第 1 行的 `import { c as _c } from "react/compiler-runtime"`、
+ *        函数体里的 `const $ = _c(18)` 和 `$[0]` `$[1]` 缓存槽位、
+ *        末尾的 `//# sourceMappingURL=data:application/json;base64,...`。
+ *  那些 `if ($[0] !== content) { ... $[0] = content }` 是编译器自动插入的
+ *  「值没变就复用缓存」逻辑，等价于手写的 useMemo，**不要手工编辑本文件**。
+ *
+ * ---------------------------------------------------------------------------
+ *  【一句话定位】
+ *  ---------------------------------------------------------------------------
+ *  MCP 是开放生态，返回的东西什么格式都有：纯文本、深层嵌套的 JSON、
+ *  图片、甚至是「一个 JSON 里包着一大段换行文本」。
+ *  本文件的职责就是**猜出最合适的展示方式**，把杂乱的输出画成人能读的样子。
+ *
+ * ---------------------------------------------------------------------------
+ *  【在架构中的位置】
+ *  ---------------------------------------------------------------------------
+ *      src/tools/MCPTool/MCPTool.ts（模板）
+ *        ├─ renderToolUseMessage()             ← ★ 本文件
+ *        ├─ renderToolUseProgressMessage()     ← ★ 本文件（进度条）
+ *        └─ renderToolResultMessage()          ← ★ 本文件（结果，最复杂）
+ *              ├─ trySlackSendCompact()        ← ★ 本文件（Slack 发帖特例）
+ *              ├─ getContentSizeEstimate()     ← src/utils/mcpValidation.js（估算 token 数）
+ *              └─ MCPTextOutput()              ← ★ 本文件（三种渲染策略）
+ *                    ├─ tryUnwrapTextPayload() ← ★ 本文件（策略 1）
+ *                    ├─ tryFlattenJson()       ← ★ 本文件（策略 2）
+ *                    └─ OutputLine             ← 兜底（策略 3，原样输出 + 截断）
+ *
+ *  真正的 MCP 连接/调用/鉴权在 src/services/mcp/；
+ *  能不能折叠的判定在 src/tools/MCPTool/classifyForCollapse.ts。
+ *
+ * ---------------------------------------------------------------------------
+ *  【本文件包含什么】
+ *  ---------------------------------------------------------------------------
+ *   常量（一堆阈值，都是「多大算大」的经验值）：
+ *     MCP_OUTPUT_WARNING_THRESHOLD_TOKENS = 10_000   超过就警告「这很占上下文」
+ *     MAX_INPUT_VALUE_CHARS = 80                     非 verbose 时单个入参值截断长度
+ *     MAX_FLAT_JSON_KEYS = 12                        超过这么多顶层 key 就不做扁平展示
+ *     MAX_FLAT_JSON_CHARS = 5_000                    超过就不尝试扁平解析
+ *     MAX_JSON_PARSE_CHARS = 200_000                 超过就不尝试 JSON 解析（性能保护）
+ *     UNWRAP_MIN_STRING_LEN = 200                    多长的字符串算「主体内容」
+ *
+ *   函数：
+ *     renderToolUseMessage()          渲染「即将调用」：`channel: "C123", text: "hi"`
+ *     renderToolUseProgressMessage()  渲染进度（`MCPProgress` → 百分比进度条）
+ *     renderToolResultMessage()       渲染结果（含大响应警告、图片块、Slack 特例）
+ *     MCPTextOutput()                 内部组件：三种渲染策略依次尝试
+ *     parseJsonEntries()              把字符串当 JSON 对象解析并返回键值对
+ *     tryFlattenJson()                ★ 策略 2：小扁对象 → 对齐的 key: value
+ *     tryUnwrapTextPayload()          ★ 策略 1：一个字段是大段文本 → 剥出来单独展示
+ *     trySlackSendCompact()           ★ 特例：识别 Slack 发帖结果，压成一行超链接
+ *
+ * ---------------------------------------------------------------------------
+ *  【★ MCPTextOutput 的三层策略（本文件最精彩的部分）★】
+ *  ---------------------------------------------------------------------------
+ *  MCP 输出最烦人的形态是：`{"messages": "line1\nline2\nline3..."}`
+ *  —— 里面明明是一大段带换行的文本，但被 JSON 包着，`\n` 全被转义成字面量。
+ *  直接 pretty-print 会打印出一行超长的 "line1\nline2\n..."，完全没法读。
+ *
+ *  所以依次尝试三种策略，**命中即返回**：
+ *
+ *   策略 1  tryUnwrapTextPayload()  「剥壳」
+ *      识别「某个字段是一大段文本（>200 字符或含换行），其余字段都是小标量」的结构，
+ *      把那段文本**剥出来**交给 OutputLine（它会做真正的换行和截断），
+ *      其余小字段作为 extras 灰显在上方。
+ *      例：{"messages": "...", "has_more": false} → 正文 + 灰字 "has_more: false"
+ *
+ *   策略 2  tryFlattenJson()  「摊平」
+ *      如果是个**小的扁平对象**（≤12 个 key、每个值都是标量或很短的嵌套对象），
+ *      就渲染成**对齐**的 key: value 列表（用 padEnd 让冒号对齐，很好读）。
+ *      任何一个嵌套对象超过 120 字符就**整体放弃**（说明不适合摊平）。
+ *
+ *   策略 3  OutputLine  「原样」
+ *      前两种都不匹配（比如是数组、是超大 JSON、是纯文本），
+ *      就交给 OutputLine 做 pretty-print + 截断。永远有兜底，不会崩。
+ *
+ *  为什么阈值检查要放在**解析之前**？
+ *    （parseJsonEntries 里先判长度再 JSON.parse）
+ *    因为 JSON.parse 一个 200MB 的字符串会把主线程卡死。
+ *    先量长度、超限直接返回 null，是**廉价的前置过滤**。
+ *
+ * ---------------------------------------------------------------------------
+ *  【TS / TSX 语法速查（Java 工程师视角）】
+ *  ---------------------------------------------------------------------------
+ *   - `feature('MCP_RICH_OUTPUT')`  ★★ **编译期**常量，不是运行时 if！
+ *                          来自 `import { feature } from 'bun:bundle'`。
+ *                          打包时被替换成 true/false，再经 tree-shaking 把
+ *                          整段代码从产物里删掉（Dead Code Elimination）。
+ *                          ≈ C 的 `#ifdef XXX`，Java 里没有对应物。
+ *                          副作用：它**只能**用在 if / 三元的**条件位置**，
+ *                          不能先赋给变量再判断 —— 所以你会看到
+ *                          `feature('X') ? <A/> : <B/>` 这种挤在一行的写法，
+ *                          那不是风格差，是 DCE 的硬性约束。
+ *
+ *   - `.at(-1)`            取最后一个元素（负索引）。
+ *                          ≈ Java 的 `list.get(list.size()-1)`，JS 有语法糖。
+ *                          本文件用它拿「最新一条进度消息」。
+ *
+ *   - `?.` 可选链           `lastProgress?.data` ≈
+ *                          `lastProgress != null ? lastProgress.data : null`。
+ *   - `??` 空值合并         `progressMessage ?? \`Processing… ${progress}\``
+ *                          ≈ 「没有就用备选」。
+ *                          ⚠️ 与 `||` 的区别：`??` 只在 null/undefined 时才取右边，
+ *                          `||` 还会把 0、''、false 也当成「没有」。
+ *                          本文件用它是对的：空字符串的提示语应该被**保留**而不是替换。
+ *
+ *   - `` `Processing… ${progress}` ``  模板字符串插值。
+ *                          ≈ String.format("Processing… %s", progress)。
+ *
+ *   - `Math.min(1, Math.max(0, progress / total))`
+ *                          把比例**夹在 [0,1]**。为什么必须夹？
+ *                          因为 progress/total 来自**外部 server**，它可能发来
+ *                          progress > total（进度条会画爆）或负数。
+ *                          这是「不信任外部输入」的防御性写法。
+ *
+ *   - `output as MCPToolResult`  类型断言 ≈ Java 的强制转换 `(MCPToolResult) output`。
+ *                          运行时**不做检查**，纯粹让编译器闭嘴。
+ *                          这里不得不用：函数签名写的是 `string | MCPToolResult`，
+ *                          但实现里按 MCPToolResult 处理。
+ *
+ *   - `Array.isArray(x)`    运行时判断是不是数组（TypeScript 的编译期类型
+ *                          在运行时不存在，所以数组 vs 对象必须这样判断）。
+ *                          ≈ Java 的 `x instanceof List`。
+ *
+ *   - `item.type === 'text' && 'text' in item && item.text !== null && item.text !== undefined`
+ *                          四重判断，看着啰嗦但每一层都有用：
+ *                            type === 'text'  先看 tag（判别联合）
+ *                            'text' in item   再确认真的有这个字段（外部数据不可信）
+ *                            !== null / !== undefined  TS 需要这两步才能收窄类型
+ *                          这是对接外部协议时的典型防御写法。
+ *
+ *   - `String(item.text)`   强制转成字符串。因为 text 字段理论上是 string，
+ *                          但外部 server 可能塞个数字进来，显示前统一转一下更稳。
+ *
+ *   - `[string, unknown][]` **元组（tuple）类型的数组**：每个元素是一个
+ *                          「字符串 + 任意值」的二元组。
+ *                          ≈ Java 里 `List<Map.Entry<String, Object>>` 的轻量写法，
+ *                          或说 `List<Pair<String, Object>>`。
+ *
+ *   - `entries?.find(([k]) => k === 'message_link')?.[1]`
+ *                          三层连招，逐个拆解：
+ *                            `entries?.`    entries 可能是 null（解析失败）→ 整体短路
+ *                            `.find(...)`   找 key 叫 message_link 的那一项
+ *                            `([k]) => ...` 解构参数：只要二元组的第一个元素
+ *                            `?.[1]`        find 可能返回 undefined → 再可选链取第二个元素
+ *                          ≈ Java 要写四行 null 检查，这里一行。
+ *
+ *   - `inp?.channel_id ?? inp?.channel ?? m[1]`
+ *                          ?? **可以链式串联**：依次回退，直到取到第一个非 null 的值。
+ *                          语义：「优先用工具入参里的 channel_id，没有就用 channel，
+ *                                都没有就用从 URL 正则里抠出来的频道 ID」。
+ *
+ *   - `t.includes('\n') && t.length > 50`
+ *                          `&&` 的短路：不含换行就不会去算 length（微不足道的优化）。
+ *                          语义：「含换行**且**不算太短」才算「大段文本」。
+ *
+ *   - `t.replace(/\s+/g, ' ')`  把所有连续空白压成一个空格。
+ *                          为什么要压？因为 extras 是**单行**灰字展示，
+ *                          原文本里的换行会把对齐弄乱。
+ *
+ *   - `key.padEnd(maxKeyWidth)`  右填充到指定宽度，让冒号**对齐**。
+ *                          ≈ Java 的 String.format("%-12s", key)。
+ *                          maxKeyWidth 是所有 key 的**最大显示宽度**（用 stringWidth
+ *                          算而不是 length，因为中日文字符一个占两格）。
+ *
+ *   - `Math.max(...flat.map(_temp2))`  展开运算符把数组变成**多个参数**传给 max。
+ *                          ≈ Java 的 stream().mapToInt().max()。
+ *
+ *   - `jsonParse` / `jsonStringify` 从 utils/slowOperations.js 导入：
+ *                          命名上就提醒你「这操作慢」（可能用 worker 或分块处理），
+ *                          这也是为什么要先用长度阈值过滤再调它。
+ *
+ *   - JSX：`<ProgressBar ratio={ratio} width={20} />`
+ *                          属性就是 props ≈ 构造参数。`<Box flexDirection="row" gap={1}>`
+ *                          是布局容器（终端里的 flexbox）。
+ *
+ *   - `createHyperlink(url, text)`  生成终端可点击的超链接（OSC 8 转义序列）。
+ *                          终端支持的话能让 Slack 消息链接直接点开。
+ */
+
 import { c as _c } from "react/compiler-runtime";
 import { feature } from 'bun:bundle';
 import figures from 'figures';
@@ -18,26 +204,54 @@ import { jsonParse, jsonStringify } from '../../utils/slowOperations.js';
 import type { inputSchema } from './MCPTool.js';
 
 // Threshold for displaying warning about large MCP responses
+// 【中文补充】1 万 token 的警告线。为什么要警告？因为 MCP 结果会**原样**进上下文，
+// 一个 5 万 token 的响应能把整个对话窗口吃掉，触发自动压缩、甚至让模型「忘记」
+// 前面的内容。给个警告让用户知道「这次调用很贵」。
 const MCP_OUTPUT_WARNING_THRESHOLD_TOKENS = 10_000;
 
 // In non-verbose mode, truncate individual input values to keep the header
 // compact. Matches BashTool's philosophy of showing enough to identify the
 // call without dumping the entire payload inline.
+// 【中文补充】80 字符：够看清「这是在发什么」，又不至于把整段正文铺满屏幕。
+// 与 BashTool 保持一致的哲学 —— 只显示「足以识别这次调用」的量。
 const MAX_INPUT_VALUE_CHARS = 80;
 
 // Max number of top-level keys before we fall back to raw JSON display.
 // Beyond this a flat k:v list is more noise than help.
+// 【中文补充】超过 12 个 key，铺出来的 k:v 列表比 raw JSON 还长还乱，不如不摊平。
 const MAX_FLAT_JSON_KEYS = 12;
 
 // Don't attempt flat-object parsing for large blobs.
+// 【中文补充】摊平只适合「小」对象；5KB 以上直接跳过解析，省一次 JSON.parse。
 const MAX_FLAT_JSON_CHARS = 5_000;
 
 // Don't attempt to parse JSON blobs larger than this (perf safety).
+// 【中文补充】20 万字符的硬上限：JSON.parse 是**同步阻塞**的，
+// 解析一个几百 MB 的字符串会卡死整个 UI。这条是纯粹的性能保险丝，
+// 宁可显示原始文本也不能让界面假死。
 const MAX_JSON_PARSE_CHARS = 200_000;
 
 // A string value is "dominant text payload" if it has newlines or is
 // long enough that inline display would be worse than unwrapping.
+// 【中文补充】200 字符：「够长，值得单独占一块展示」的经验阈值。
 const UNWRAP_MIN_STRING_LEN = 200;
+/**
+ * 【中文补充】渲染「MCP 工具即将被调用」那一行，例如：
+ *     mcp__slack__post_message(channel: "C123", text: "hello…")
+ *
+ * 为什么要把入参显示出来？因为 MCP 工具动辄几十个，用户需要一眼看出
+ * 「模型到底要让 Slack 发什么」—— 这是**安全审查**的重要一环
+ * （发给错误的频道、删错的资源，都靠这一眼发现）。
+ *
+ * 两个细节：
+ *   ① 没有入参时返回空串 ''（不是 null）—— 表示「这一行什么都不显示」
+ *   ② 非 verbose 且开了 MCP_RICH_OUTPUT 时，单个值超过 80 字符会被截断并加省略号
+ *      （注意 `feature(...)` 是编译期常量，见文件头说明）
+ *
+ * @param input   MCP 工具的入参（任意字段，因为 MCP 是开放生态）
+ * @param verbose true 时不截断
+ * @returns 一行文本
+ */
 export function renderToolUseMessage(input: z.infer<ReturnType<typeof inputSchema>>, {
   verbose
 }: {
@@ -54,6 +268,22 @@ export function renderToolUseMessage(input: z.infer<ReturnType<typeof inputSchem
     return `${key}: ${rendered}`;
   }).join(', ');
 }
+/**
+ * 【中文补充】渲染 MCP 工具的**执行进度**（很多 MCP server 会持续推送进度通知）。
+ *
+ * 为什么只取**最后一条**（`.at(-1)`）？因为进度消息是不断累积的
+ * （10%、20%、30%…），屏幕上只应该显示最新状态，而不是把历史全打出来。
+ *
+ * 三种展示形态：
+ *   ① 还没有进度数据 / progress 字段缺失 → 灰字 "Running…"（转圈感）
+ *   ② 有 total（知道总量）→ 真进度条 + 百分比
+ *      `ratio` 用 Math.min/max 夹在 [0,1]：因为 progress/total 来自外部 server，
+ *      它可能发来超过总量或负数的值，不夹一下进度条会画爆。
+ *   ③ 有 progress 但**不知道** total → 只能显示 "Processing… 42"（走了多少步）
+ *
+ * @param progressMessagesForMessage 累积的进度消息数组
+ * @returns React 元素
+ */
 export function renderToolUseProgressMessage(progressMessagesForMessage: ProgressMessage<MCPProgress>[]): React.ReactNode {
   const lastProgress = progressMessagesForMessage.at(-1);
   if (!lastProgress?.data) {
@@ -88,6 +318,30 @@ export function renderToolUseProgressMessage(progressMessagesForMessage: Progres
       <Text dimColor>{progressMessage ?? `Processing… ${progress}`}</Text>
     </MessageResponse>;
 }
+/**
+ * 【中文补充】★ 渲染 MCP 工具的**返回结果** —— 本文件最复杂的函数。
+ *
+ * 处理顺序（命中即返回 / 层层兜底）：
+ *   ① **Slack 特例**（非 verbose 时）：如果是「发帖成功」的结果，
+ *      压成一行 `Sent a message to #channel`（带超链接）。
+ *      为什么不走通用渲染？因为这种结果 99% 的信息量就是「发成功了 + 在哪」，
+ *      打印一长串 JSON 纯属浪费。
+ *   ② **大响应警告**：估算 token 数，超过 1 万就在顶部加一行黄色警告，
+ *      提醒用户「这次调用很占上下文」。
+ *   ③ **按输出形态分流**：
+ *        - 是数组（MCP 的 content blocks）→ 逐块渲染
+ *            图片块 → 显示 `[Image]`（终端画不了图，只给占位）
+ *            文本块 → 交给 MCPTextOutput 走三种策略
+ *        - 是空（null/undefined/空串）→ 显示 `(No content)`
+ *        - 其它（字符串）→ 交给 MCPTextOutput
+ *   ④ 有警告就在内容外面再包一层（警告在上、内容在下）
+ *
+ * @param output                     MCP 工具输出：可能是字符串，也可能是 content block 数组
+ * @param _progressMessagesForMessage 进度消息（此处不用，下划线表示故意忽略）
+ * @param verbose                    true 时完整展开、不做紧凑化
+ * @param input                      原始入参（Slack 特例需要它拿 channel）
+ * @returns React 元素
+ */
 export function renderToolResultMessage(output: string | MCPToolResult, _progressMessagesForMessage: ProgressMessage<ToolProgressData>[], {
   verbose,
   input
@@ -252,6 +506,13 @@ function MCPTextOutput(t0) {
 }
 
 /**
+ * 【中文补充】下面两个 `_temp` / `_temp2` 是 React Compiler **自动提取**出来的
+ * 小箭头函数（原本是内联的 lambda，编译器为了做缓存把它们提到外面并命名为 _temp）。
+ * 看到这种名字别困惑，对比末尾 sourcemap 里的原始源码就能对上号。
+ *   _temp2([k])      → 算 key 的**显示宽度**（用 stringWidth 而不是 length，
+ *                      因为中文/emoji 一个字占两格，用 length 会算错对齐）
+ *   _temp([k, v])    → 把一对 key/value 拼成 "k: v" 显示文本
+ *
  * Parse content as a JSON object and return its entries. Null if content
  * doesn't parse, isn't an object, is too large, or has 0/too-many keys.
  */
@@ -263,6 +524,27 @@ function _temp(t0) {
   const [k, v] = t0;
   return `${k}: ${v}`;
 }
+/**
+ * 【中文补充】把一段字符串**当作 JSON 对象**解析，返回它的键值对数组；
+ * 任何一步不合格都返回 null（而不是抛异常）。
+ *
+ * 这是 tryFlattenJson 和 tryUnwrapTextPayload 共用的**前置守卫**，
+ * 五道过滤缺一不可：
+ *   ① 去空白后为空 → null
+ *   ② 长度超过 maxChars → null（**先量长度再解析**，避免为大字符串付解析代价）
+ *   ③ 第一个字符不是 '{' → null（不是对象，可能是数组 `[...]` 或纯文本）
+ *      —— 这是个廉价的快速否定：不用解析就能排除掉绝大多数非对象输入
+ *   ④ JSON.parse 抛异常 → catch 住返回 null（畸形 JSON）
+ *   ⑤ 解析出来是 null / 非对象 / 是数组 → null
+ *      （注意 `typeof null === 'object'`，所以必须**先**判 null 再判 typeof，
+ *        顺序写反就会把 null 当成合法对象）
+ *   ⑥ 键值对数量为 0 或超过 maxKeys → null
+ *
+ * @param content  待解析的字符串
+ * @param maxChars 长度上限（超过直接放弃）
+ * @param maxKeys  允许的顶层 key 数量上限
+ * @returns [key, value] 元组数组；不合格返回 null
+ */
 function parseJsonEntries(content: string, {
   maxChars,
   maxKeys
@@ -295,6 +577,31 @@ function parseJsonEntries(content: string, {
  * small nested object, flatten it to [key, displayValue] pairs. Nested
  * objects get one-line JSON. Returns null if content doesn't qualify.
  */
+/**
+ * 【中文补充】★ 渲染策略 2 —— 「摊平」：把小扁对象渲染成**对齐的** key: value 列表。
+ *
+ * 适用形态（例如 MCP 返回的仓库信息）：
+ *     {"name": "claude-code", "stars": 12345, "private": false, "archived": false}
+ * 渲染成：
+ *     name      : claude-code
+ *     stars     : 12345
+ *     private   : false
+ *     archived  : false
+ * 冒号用 padEnd 对齐，比 raw JSON（带一堆花括号引号）好读得多。
+ *
+ * 逐值的处理规则（这就是下面 if/else 链的含义）：
+ *   - string                    → 原样用
+ *   - null / number / boolean   → String() 转成字符串
+ *   - object（嵌套）            → jsonStringify 压成单行；**超过 120 字符就整体放弃**
+ *                                 （说明这个对象太复杂，摊平反而更难读，交给策略 3）
+ *   - 其它（数组等）            → 直接放弃
+ *
+ * 注意这里的「整体放弃」语义：任何一个值不合格就 return null，
+ * 而不是「跳过这一个」。因为半摊平、半原样的输出最让人困惑，不如全走兜底。
+ *
+ * @param content 可能是 JSON 的字符串
+ * @returns [key, displayValue][] 供 UI 对齐渲染；不适合摊平则返回 null
+ */
 export function tryFlattenJson(content: string): [string, string][] | null {
   const entries = parseJsonEntries(content, {
     maxChars: MAX_FLAT_JSON_CHARS,
@@ -323,6 +630,38 @@ export function tryFlattenJson(content: string): [string, string][] | null {
  * (multiline or long) and all siblings are small scalars, unwrap it. This
  * handles the common MCP pattern of {"messages":"line1\nline2..."} where
  * pretty-printing keeps \n escaped but we want real line breaks + truncation.
+ */
+/**
+ * 【中文补充】★ 渲染策略 1 —— 「剥壳」：把「JSON 里包着一大段文本」的主体剥出来。
+ *
+ * 这是本文件最有价值的一个函数，专门解决 MCP 的经典输出形态：
+ *
+ *     {"messages": "line1\nline2\nline3...", "has_more": false}
+ *
+ * 问题在于：`\n` 在 JSON 里是**转义序列**，pretty-print 会打印成一行
+ * 超长的 `line1\nline2\nline3...`，完全没法读。
+ * 但其实用户想看的就是那段文本本身（带真正的换行、能被截断）。
+ *
+ * 所以本函数把它拆成两部分：
+ *   body   那段大文本 → 交给 OutputLine 做真换行 + 截断
+ *   extras 其余小字段 → 灰显在上方（如 `has_more: false`），不丢信息
+ *
+ * 判定「谁是主体」的规则（下面循环里的逻辑）：
+ *   - 是字符串 **且**（长度 > 200 **或**（含换行 且 长度 > 50））→ 算「主体」
+ *       为什么是「或」两个条件？
+ *         长但没有换行（比如一整段日志被塞成一个字符串）→ 也该剥
+ *         短但**有换行**（比如一个 3 行的短消息）→ 也该剥，因为换行被转义了最难读
+ *       为什么要先 trimEnd？因为尾部一个 `\n` 不该让一个短字段「变成」主体。
+ *   - **出现两个**主体 → 放弃（return null）：不知道该显示哪个，歧义太大
+ *   - 非主体的字符串**超过 150 字符** → 放弃：说明 extras 也不小，不该被压成灰字
+ *   - 非主体且是 null/number/boolean → 放进 extras
+ *   - 非主体且是嵌套对象/数组 → 放弃（交给策略 2 或 3）
+ *
+ * 注意这里的 maxKeys 是 **4**（比 tryFlattenJson 的 12 严格得多）：
+ *   因为「剥壳」只在「字段很少、一眼能看出谁是主体」时才可靠。
+ *
+ * @param content 可能是 JSON 的字符串
+ * @returns { body, extras }；不适合剥壳则返回 null
  */
 export function tryUnwrapTextPayload(content: string): {
   body: string;
@@ -360,6 +699,17 @@ export function tryUnwrapTextPayload(content: string): {
     extras
   };
 }
+/**
+ * 【中文补充】Slack 消息永久链接的正则。形如：
+ *     https://myteam.slack.com/archives/C09EVDAN1NK/p1234567890123456
+ * 捕获组 `([A-Z0-9]+)` 抓的就是**频道 ID**（C 开头大写字母数字）。
+ *
+ * 为什么要用 `^...$` 全匹配而不是部分匹配？
+ *   因为这条正则同时承担「**验证**」职责：只有确认是合法的 Slack 归档链接，
+ *   才敢把它渲染成可点击的超链接。部分匹配会让恶意 URL
+ *   （比如 https://evil.com/?x=https://a.slack.com/archives/...）也混进来 ——
+ *   那会变成一个钓鱼链接。全匹配是最省事也最可靠的白名单方式。
+ */
 const SLACK_ARCHIVES_RE = /^https:\/\/[a-z0-9-]+\.slack\.com\/archives\/([A-Z0-9]+)\/p\d+$/;
 
 /**
@@ -368,6 +718,33 @@ const SLACK_ARCHIVES_RE = /^https:\/\/[a-z0-9-]+\.slack\.com\/archives\/([A-Z0-9
  * both return `message_link` in the result. The channel label prefers the
  * tool input (may be a name like "#foo" or an ID like "C09EVDAN1NK") and
  * falls back to the ID parsed from the archives URL.
+ */
+/**
+ * 【中文补充】★ 特例处理：识别「Slack 发帖成功」的结果，压成一行超链接。
+ *
+ * 为什么要单独为 Slack 写一段？因为「发消息」是最高频的 MCP 操作之一，
+ * 而它的返回是一个包含各种元数据的大 JSON，用户真正关心的只有两件事：
+ *   ① 发出去了吗（能匹配到本函数就说明成功了）
+ *   ② 发到哪了（频道 + 可点击的链接）
+ * 于是压成：
+ *     Sent a message to #general        ← #general 是可点击的超链接
+ *
+ * 判定流程（每一步都可能短路返回 null）：
+ *   ① 输出可能是 content block 数组 → 先找出第一个 text 块取出文本
+ *   ② 文本里必须包含 `"message_link"`（廉价的快速否定，避免无谓解析）
+ *   ③ 解析出 message_link 的值，必须是 string
+ *   ④ 用上面的正则验证它确实是 Slack 归档链接（顺带抠出频道 ID）
+ *
+ * 频道名的取法（这行 `inp?.channel_id ?? inp?.channel ?? m[1]`）：
+ *   优先用**工具入参**里的 channel_id / channel —— 因为那可能是用户写的
+ *   可读的名字（"#general"），比机器 ID 友好；
+ *   都没有时才退化到从 URL 里抠出来的 ID（"C09EVDAN1NK"）。
+ *   `??` 的链式回退正好表达「依次尝试」。
+ *   最后统一补上 `#` 前缀，保持 Slack 的视觉习惯。
+ *
+ * @param output MCP 工具输出（字符串或 content block 数组）
+ * @param input  原始入参（用来拿频道名）
+ * @returns { channel, url }；不是 Slack 发帖结果则返回 null
  */
 export function trySlackSendCompact(output: string | MCPToolResult, input: unknown): {
   channel: string;

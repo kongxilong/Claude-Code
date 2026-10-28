@@ -1,3 +1,51 @@
+/**
+ * 【一句话定位】Bash 工具的**主实现文件**：定义 `BashTool` 这个 tool 对象本身——它的输入/输出
+ *   schema、只读判定、权限判定、输入校验、真正跑 shell 命令并上报进度的 `call()`，以及把
+ *   shell 输出整理成「回给模型的 tool_result」的那一整套逻辑。
+ *
+ * 【在架构中的位置】
+ *   上游：模型发出 tool_use(Bash) → 框架（src/Tool.ts 的 buildTool）回调本文件注册的各个钩子
+ *   同层协作（本目录里那些「规则引擎」文件，本文件只负责**编排**，具体规则都在那里）：
+ *     - bashPermissions.js   → checkPermissions（allow / deny / ask + 建议规则）
+ *     - readOnlyValidation.js → isReadOnly（是否只读，决定能否并发、能否免权限）
+ *     - pathValidation.js / bashSecurity.js → 被 bashPermissions 间接调用（路径白名单 / 语法扫描）
+ *     - sedEditParser.js / sedValidation.js → 识别并校验 `sed -i` 就地编辑
+ *     - shouldUseSandbox.js / prompt.js / toolName.js / UI.tsx / utils.ts → 沙箱、提示词、展示
+ *   下游：utils/Shell.js 的 exec() 真正 fork 出 bash 进程；tasks/LocalShellTask 管理后台任务
+ *   调用链：模型 → validateInput → checkPermissions → call() → runShellCommand()（异步生成器）
+ *            → exec() → …… → mapToolResultToToolResultBlockParam() → 回给模型
+ *
+ * 【本文件包含什么】
+ *   一、展示/策略常量：PROGRESS_THRESHOLD_MS、ASSISTANT_BLOCKING_BUDGET_MS、
+ *       BASH_SEARCH_COMMANDS、BASH_READ_COMMANDS、BASH_LIST_COMMANDS、
+ *       BASH_SEMANTIC_NEUTRAL_COMMANDS、BASH_SILENT_COMMANDS、
+ *       DISALLOWED_AUTO_BACKGROUND_COMMANDS、COMMON_BACKGROUND_COMMANDS
+ *   二、命令分类小函数：isSearchOrReadBashCommand、isSilentBashCommand、
+ *       getCommandTypeForLogging、isAutobackgroundingAllowed、detectBlockedSleepPattern
+ *   三、sed 就地编辑的「模拟执行」：applySedEdit（权限弹窗里预览什么就真的写什么）
+ *   四、schema：fullInputSchema / inputSchema / outputSchema（zod 一份声明同时产出校验和类型）
+ *   五、BashTool 主体：buildTool({...}) 里注册的一堆钩子方法
+ *   六、执行引擎：runShellCommand() 异步生成器（超时自动后台、Ctrl+B 后台、
+ *       assistant 模式自动后台、每秒进度上报）
+ *
+ * 【TS 语法速查】（本文件实际出现的，Java 工程师视角）
+ *   - `function*` + `yield` = **生成器**：函数可以「边跑边往外吐值」，调用方随时取；
+ *     Java 没有对应物，最接近的是「自己写个 Iterator + 阻塞队列」
+ *   - `async function*` = 异步生成器，类型写成 `AsyncGenerator<产出类型, 最终返回类型, 入参类型>`；
+ *     其中 `return xxx` 的值会成为最后那次 `.next()` 的 `value`（本文件就拿它当最终 ExecResult）
+ *   - `Promise.race([a, b])` ≈ CompletableFuture.anyOf：谁先完成听谁的
+ *   - `z.object({...})` + `z.infer<typeof S>`：zod 用「一份 schema」同时产出**运行时校验**和
+ *     **静态类型**，≈ Java 的 Bean Validation 注解 + 由注解生成 DTO（不用手写两遍）
+ *   - `get inputSchema()`：`getter`，≈ Java 的 getXxx()，但调用时不写括号（`obj.inputSchema`）
+ *   - `satisfies T`：校验「这个对象字面量确实符合 T」，但**不**把类型擦成 T（各字段的具体
+ *     类型、`this` 的类型都保留）。比 `as T` 安全——`as T` 是无条件强行断言
+ *   - `Pick<T, 'a' | 'b'>`：从一个类型里只挑几个字段，≈ 临时定义一个小接口
+ *   - `a?.b` 可选链、`??` 空值合并、`x!` 非空断言、`as X` 强制转换
+ *   - 类型里字段后的 `?`（如 `run_in_background?: boolean`）= 可空 / 可不填（≈ Optional）
+ *   - JSX：`<BackgroundHint />` 是在 TS 里直接写标签，编译后是 `React.createElement(...)`；
+ *     这也是本文件后缀必须是 .tsx 而不是 .ts 的原因（.ts 文件里不能写标签）
+ *   - `// eslint-disable-next-line xxx`：只关掉**下一行**的 lint 规则（这里为了在顶层读 process.env）
+ */
 import { feature } from 'bun:bundle';
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs';
 import { copyFile, stat as fsStat, truncate as fsTruncate, link } from 'fs/promises';
@@ -52,11 +100,19 @@ import { buildImageToolResult, isImageOutput, resetCwdIfOutsideProject, resizeSh
 const EOL = '\n';
 
 // Progress display constants
+// 展示进度的门槛：命令跑过 2 秒才开始显示进度条。
+//   为什么不一开始就显示？绝大多数命令几十毫秒就结束了，
+//   弹一下再消失只会造成闪烁，所以先用 2 秒「静默期」过滤掉快命令。
 const PROGRESS_THRESHOLD_MS = 2000; // Show progress after 2 seconds
 // In assistant mode, blocking bash auto-backgrounds after this many ms in the main agent
+// assistant 模式下，主 agent 的「阻塞预算」：一条前台 bash 跑过 15 秒，
+//   就自动把它挪到后台，让主 agent 继续协调别的事（命令并不会被杀掉）。
+//   15_000 里的下划线是 TS 的数字分隔符（Java 也支持），只为好看，不影响值。
 const ASSISTANT_BLOCKING_BUDGET_MS = 15_000;
 
 // Search commands for collapsible display (grep, find, etc.)
+// 「搜索类」命令白名单：命中它们的命令在 UI 里可折叠，摘要写成 Searched …
+//   Set ≈ Java 的 HashSet，has() 是 O(1)。
 const BASH_SEARCH_COMMANDS = new Set(['find', 'grep', 'rg', 'ag', 'ack', 'locate', 'which', 'whereis']);
 
 // Read/view commands for collapsible display (cat, head, etc.)
@@ -69,6 +125,8 @@ const BASH_READ_COMMANDS = new Set(['cat', 'head', 'tail', 'less', 'more',
 // Directory-listing commands for collapsible display (ls, tree, du).
 // Split from BASH_READ_COMMANDS so the summary says "Listed N directories"
 // instead of the misleading "Read N files".
+// 「列目录类」单独一档：这样摘要会说「Listed N directories」，
+//   而不是误导性的「Read N files」——ls 并没有读文件内容。
 const BASH_LIST_COMMANDS = new Set(['ls', 'tree', 'du']);
 
 // Commands that are semantic-neutral in any position — pure output/status commands
@@ -78,6 +136,8 @@ const BASH_SEMANTIC_NEUTRAL_COMMANDS = new Set(['echo', 'printf', 'true', 'false
 ]);
 
 // Commands that typically produce no stdout on success
+// 「成功也没输出」的命令白名单：命中它们时 UI 显示 Done，而不是 (No output)，
+//   避免让模型/用户误以为命令失败了。
 const BASH_SILENT_COMMANDS = new Set(['mv', 'cp', 'rm', 'mkdir', 'rmdir', 'chmod', 'chown', 'chgrp', 'touch', 'ln', 'cd', 'export', 'unset', 'wait']);
 
 /**
@@ -91,6 +151,24 @@ const BASH_SILENT_COMMANDS = new Set(['mv', 'cp', 'rm', 'mkdir', 'rmdir', 'chmod
  * Semantic-neutral commands (echo, printf, true, false, :) are skipped in any
  * position, as they're pure output/status commands that don't affect the read/search
  * nature of the pipeline (e.g. `ls dir && echo "---" && ls dir2` is still a read).
+ */
+/**
+ * 判断一条 bash 命令是否属于「搜索 / 读取 / 列目录」，只影响 UI 展示（是否折叠、摘要措辞）。
+ *
+ * 为什么需要：terminal 里输出一大屏 grep/cat 结果很占地方，UI 想把它折叠成一行摘要；
+ *   但只有确认「整条命令真的只是读」时才敢折叠——万一里面有 rm 呢。
+ *
+ * 入参：command —— 用户/模型给出的整条命令字符串（可能含 | && ; 等操作符）
+ * 返回：{ isSearch, isRead, isList } 三个布尔，可同时为真（如 `grep x | wc -l`）
+ *
+ * 关键步骤：
+ *   ① 先按操作符切段（splitCommandWithOperators）；切不动（语法错）就当作「不是读」，保守返回全 false
+ *   ② 逐段取首词当 baseCommand：重定向符号 `> >> >&` 后面那一段是文件名，要跳过
+ *   ③ 语义中性命令（echo/printf/true/false/:）直接跳过——它们不改变「读」的性质
+ *      （`ls a && echo --- && ls b` 仍然是纯读）
+ *   ④ 一旦遇到既不在搜索表、也不在读表/列表里的命令 → 整条命令判为「非读」，立刻返回全 false
+ *      （对应 Java 语义：管道里只要有一环会写，整条就不可折叠）
+ *   ⑤ 全是中性命令（例如只有 `echo foo`）也不算读，返回全 false
  */
 export function isSearchOrReadBashCommand(command: string): {
   isSearch: boolean;
@@ -175,6 +253,19 @@ export function isSearchOrReadBashCommand(command: string): {
  * Checks if a bash command is expected to produce no stdout on success.
  * Used to show "Done" instead of "(No output)" in the UI.
  */
+/**
+ * 判断命令「成功时本来就没有 stdout」，用于 UI 显示 Done 而不是 (No output)。
+ *
+ * 与上面那个函数的差别：这里关注的是**有没有输出**，而不是**是否只读**。
+ *
+ * 入参：command 整条命令；返回：true = 预期无输出
+ *
+ * 关键步骤：
+ *   ① 同样按操作符切段、跳过重定向目标
+ *   ② `||` 后面紧跟的中性命令当成兜底分支跳过（`rm x || true` 里的 true 不算数）
+ *   ③ 只要有一段的 baseCommand 不在「静默命令表」里 → 返回 false
+ *   ④ 全部命中、且至少有一段非兜底命令 → true
+ */
 function isSilentBashCommand(command: string): boolean {
   let partsWithOperators: string[];
   try {
@@ -217,6 +308,8 @@ function isSilentBashCommand(command: string): boolean {
 }
 
 // Commands that should not be auto-backgrounded
+// 不允许被「自动」后台化的命令名单（目前只有 sleep）。
+//   注意：这里只管自动后台化；用户/模型显式写 run_in_background: true 时仍然照办。
 const DISALLOWED_AUTO_BACKGROUND_COMMANDS = ['sleep' // Sleep should run in foreground unless explicitly backgrounded by user
 ];
 
@@ -224,6 +317,9 @@ const DISALLOWED_AUTO_BACKGROUND_COMMANDS = ['sleep' // Sleep should run in fore
 const isBackgroundTasksDisabled =
 // eslint-disable-next-line custom-rules/no-process-env-top-level -- Intentional: schema must be defined at module load
 isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS);
+// 模型看到的入参 schema。lazySchema ≈ 懒加载：真正用到时才构造 zod schema，
+//   避免模块加载时就执行一堆正则/模板字符串（启动性能）。
+//   z.strictObject = 严格模式：多传一个字段就报错（普通 z.object 会忽略多余字段）。
 const fullInputSchema = lazySchema(() => z.strictObject({
   command: z.string().describe('The command to execute'),
   timeout: semanticNumber(z.number().optional()).describe(`Optional timeout in milliseconds (max ${getMaxTimeoutMs()})`),
@@ -240,6 +336,8 @@ For commands that are harder to parse at a glance (piped commands, obscure flags
 - curl -s url | jq '.data[]' → "Fetch JSON from URL and extract data array elements"`),
   run_in_background: semanticBoolean(z.boolean().optional()).describe(`Set to true to run this command in the background. Use Read to read the output later.`),
   dangerouslyDisableSandbox: semanticBoolean(z.boolean().optional()).describe('Set this to true to dangerously override sandbox mode and run commands without sandboxing.'),
+  // 内部专用字段：sed 就地编辑的「预览结果」。用户在权限弹窗里看到的 diff 就是它算出来的。
+  //   它只存在于 fullInputSchema（内部类型），永远不会出现在给模型的 schema 里（见下面 inputSchema）。
   _simulatedSedEdit: z.object({
     filePath: z.string(),
     newContent: z.string()
@@ -251,6 +349,11 @@ For commands that are harder to parse at a glance (piped commands, obscure flags
 // Exposing it in the schema would let the model bypass permission checks and the
 // sandbox by pairing an innocuous command with an arbitrary file write.
 // Also conditionally remove run_in_background when background tasks are disabled.
+// 给模型看的 schema = fullInputSchema 挖掉若干字段。
+//   为什么一定要挖掉 _simulatedSedEdit：它是一份「已算好的 sed 结果」，
+//   如果暴露给模型，模型就能用一条人畜无害的命令 + 任意文件内容绕开权限检查和沙箱写任意文件。
+//   另外：后台任务被禁用时，连 run_in_background 一起挖掉（免得模型调了个不存在的开关）。
+//   .omit({...}) ≈ Java 里「从 DTO 里删掉几个字段再生成新 DTO」，是类型层面的操作，编译期生效。
 const inputSchema = lazySchema(() => isBackgroundTasksDisabled ? fullInputSchema().omit({
   run_in_background: true,
   _simulatedSedEdit: true
@@ -262,7 +365,19 @@ type InputSchema = ReturnType<typeof inputSchema>;
 // Use fullInputSchema for the type to always include run_in_background
 // (even when it's omitted from the schema, the code needs to handle it)
 export type BashToolInput = z.infer<ReturnType<typeof fullInputSchema>>;
+// 常见的「长时间运行」命令，仅用于埋点统计（判断这次后台化属于哪一类命令）。
+//   `as const` 的作用：把数组锁成字面量联合类型（'npm' | 'yarn' | …），
+//   这样下面的 includes() 才能做类型安全的收窄；不加就是宽泛的 string[]。
 const COMMON_BACKGROUND_COMMANDS = ['npm', 'yarn', 'pnpm', 'node', 'python', 'python3', 'go', 'cargo', 'make', 'docker', 'terraform', 'webpack', 'vite', 'jest', 'pytest', 'curl', 'wget', 'build', 'test', 'serve', 'watch', 'dev'] as const;
+/**
+ * 从命令里提取「命令类型」用于埋点上报（npm / go / docker …，都不匹配就是 'other'）。
+ *
+ * 为什么需要：埋点想知道「用户都在后台跑些什么」，但又不能把整条命令（可能含敏感信息）
+ *   上报，所以只取一个白名单里的命令名。
+ *
+ * 注意：这里用的是 splitCommand_DEPRECATED（简单切分），不追求语法正确，
+ *   因为它只影响统计口径，不影响任何安全判定。
+ */
 function getCommandTypeForLogging(command: string): AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS {
   const parts = splitCommand_DEPRECATED(command);
   if (parts.length === 0) return 'other' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS;
@@ -276,6 +391,8 @@ function getCommandTypeForLogging(command: string): AnalyticsMetadata_I_VERIFIED
   }
   return 'other' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS;
 }
+// 出参 schema。注意 stderr 一般是空的——因为 shell 用的是「合并 fd」：
+//   子进程的标准错误已经被并进标准输出了（见 call() 里的相关注释）。
 const outputSchema = lazySchema(() => z.object({
   stdout: z.string().describe('The standard output of the command'),
   stderr: z.string().describe('The standard error output of the command'),
@@ -304,6 +421,16 @@ import type { BashProgress } from '../../types/tools.js';
  * @param command The command to check
  * @returns false for commands that should not be auto-backgrounded (like sleep)
  */
+/**
+ * 判断这条命令**允许**被「自动」后台化（超时兜底 / assistant 预算兜底）。
+ *
+ * 为什么需要：sleep 被自动后台化毫无意义（它本来就只是等，后台化反而让用户以为在干活），
+ *   所以这类命令只允许显式 run_in_background。
+ *
+ * 入参：command；返回：true = 允许自动后台化（默认允许，命中黑名单才 false）
+ *
+ * 关键步骤：① 切段取第一段 ② 取 baseCommand ③ 不在 DISALLOWED 名单里就 true
+ */
 function isAutobackgroundingAllowed(command: string): boolean {
   const parts = splitCommand_DEPRECATED(command);
   if (parts.length === 0) return true;
@@ -318,6 +445,20 @@ function isAutobackgroundingAllowed(command: string): boolean {
  * Detect standalone or leading `sleep N` patterns that should use Monitor
  * instead. Catches `sleep 5`, `sleep 5 && check`, `sleep 5; check` — but
  * not sleep inside pipelines, subshells, or scripts (those are fine).
+ */
+/**
+ * 检测「用 sleep 等一会儿再看结果」这种反模式，返回给模型的拦截原因（没命中返回 null）。
+ *
+ * 为什么需要：模型常写 `sleep 30 && curl localhost:3000` 来等服务起来。这会把主对话死死卡住，
+ *   正确做法是 run_in_background 或 Monitor 工具，所以这里直接拦掉并给出指引。
+ *
+ * 入参：command；返回：命中时是给人看的原因字符串，否则 null
+ *
+ * 关键步骤：
+ *   ① 取第一段，用正则匹配 `sleep N`（只认整数秒；`sleep 0.5` 这种小数是合法节奏控制，放行）
+ *   ② 小于 2 秒放行（限流/节流用的短 sleep 是合理的）
+ *   ③ 后面还有内容 → 提示「用 Monitor 跑后面的命令」；只有 sleep → 提示「你在等什么？」
+ *   ④ 管道/子 shell 里的 sleep 不拦（那属于脚本内部节奏，不是阻塞主对话）
  */
 export function detectBlockedSleepPattern(command: string): string | null {
   const parts = splitCommand_DEPRECATED(command);
@@ -356,6 +497,24 @@ type SimulatedSedEditContext = Pick<ToolUseContext, 'readFileState' | 'updateFil
  * Applies a simulated sed edit directly instead of running sed.
  * This is used by the permission dialog to ensure what the user previews
  * is exactly what gets written to the file.
+ */
+/**
+ * 「模拟执行」一次 sed 就地编辑：不真的跑 sed，而是把预览好的新内容直接写进文件。
+ *
+ * 为什么需要：权限弹窗给用户看的是「改前 vs 改后」的 diff。如果批准后再让 sed 自己跑一遍，
+ *   一旦 sed 表达式解析有细微差异，写进去的东西就和批准的**不一样**了。
+ *   所以这里用预览算出的结果直接落盘，做到「所见即所写」。
+ *
+ * 入参：simulatedEdit = { filePath, newContent }（预览阶段算好的目标内容）
+ *       toolUseContext = 只需要读文件状态和 undo 历史两个字段（Pick 挑出来的小接口）
+ * 返回：{ data: Out }，stdout 为空（sed 成功本来就不输出），失败时伪造 sed 的报错文案
+ *
+ * 关键步骤：
+ *   ① 先探测文件编码再读原内容；文件不存在就返回和真 sed 一样的 `No such file or directory`
+ *   ② 写 undo 历史（fileHistory），让用户能撤回
+ *   ③ 探测换行符（CRLF/LF）后按原样写回，避免把整个文件的换行风格改掉
+ *   ④ 通知 VS Code 插件文件变了
+ *   ⑤ 更新「已读文件快照」——否则接下来写这个文件会被「读后被人改过」的陈旧检测拦下
  */
 async function applySedEdit(simulatedEdit: {
   filePath: string;
@@ -417,6 +576,10 @@ async function applySedEdit(simulatedEdit: {
     }
   };
 }
+// buildTool(...) 是框架提供的「工具工厂」：把下面这一大坨钩子方法打包成一个 tool 对象。
+//   末尾的 `satisfies ToolDef<InputSchema, Out, BashProgress>` 是编译期契约检查——
+//   少写/写错一个钩子就会报错，但不会把各方法的具体类型擦掉（所以方法里能用 this.xxx）。
+//   近似 Java：实现一个接口，但保留实现类自身的类型信息。
 export const BashTool = buildTool({
   name: BASH_TOOL_NAME,
   searchHint: 'execute shell commands',
@@ -431,9 +594,15 @@ export const BashTool = buildTool({
   async prompt() {
     return getSimplePrompt();
   },
+  // 并发安全判定：只读命令才能和其他工具一起并发跑（写命令并发会互相踩）。
+  //   `?? false` 兜底：万一 isReadOnly 没定义，按「不安全」处理（失败即保守）。
   isConcurrencySafe(input) {
     return this.isReadOnly?.(input) ?? false;
   },
+  // 只读判定。为什么先算 commandHasAnyCd：命令里如果有 `cd`，
+  //   后续所有路径校验的基准目录就会变，必须先拆出来交给 checkReadOnlyConstraints 统一处理
+  //   （否则 `cd /tmp && cat x` 会拿项目根目录去校验 /tmp 下的路径，判定就错位了）。
+  //   真正的规则表在 readOnlyValidation.ts 里，这里只是编排。
   isReadOnly(input) {
     const compoundCommandHasCd = commandHasAnyCd(input.command);
     const result = checkReadOnlyConstraints(input, compoundCommandHasCd);
@@ -442,6 +611,17 @@ export const BashTool = buildTool({
   toAutoClassifierInput(input) {
     return input.command;
   },
+  // 给 hook 的 `if` 过滤条件做一个「匹配器」：判断某条 Bash(xxx) 规则是否命中这条命令。
+  //
+  // 为什么要拆成多个子命令再匹配（而不是拿整条命令去匹配）：
+  //   hook 的 `if` 语义是「没匹配 → 跳过这个 hook」，和 deny 类似，漏匹配就等于放过去。
+  //   所以 `ls && git push` 必须能命中 `Bash(git *)` 这条安全 hook，否则就绕过了。
+  //
+  // 关键步骤：
+  //   ① 用 AST 解析；解析不出 / 结构太复杂 → 返回一个「永远命中」的匹配器（宁可多跑 hook，不可漏跑）
+  //   ② 用 argv 而不是原始字符串拼接（`FOO=bar git push` 也能匹配 `Bash(git *)`，
+  //      因为 argv 已经把开头的环境变量赋值剥掉了）
+  //   ③ 规则带 `:*` 前缀时按「前缀 + 空格」匹配；否则走通配符匹配
   async preparePermissionMatcher({
     command
   }) {
@@ -481,6 +661,8 @@ export const BashTool = buildTool({
   get outputSchema(): OutputSchema {
     return outputSchema();
   },
+  // 这个名字显示在 UI 的标题上。
+  //   sed 就地编辑特殊处理成「文件编辑」的措辞（对用户来说它就是在改文件，不是在跑命令）。
   userFacingName(input) {
     if (!input) {
       return 'Bash';
@@ -499,6 +681,12 @@ export const BashTool = buildTool({
     // `new RegExp` per call. userFacingName runs per-render for every bash
     // message in history; with ~50 msgs + one slow-to-tokenize command, this
     // exceeds the shimmer tick → transition abort → infinite retry (#21605).
+    // 为什么先判环境变量再调 shouldUseSandbox（顺序不能换）：
+    //   shouldUseSandbox 内部会走 splitCommand_DEPRECATED → shell-quote，而 shell-quote 每次调用
+    //   都会 `new RegExp(...)`。userFacingName 是**每条历史消息每次重渲染**都要跑的，
+    //   积累几十条消息后再碰上一条难分词的命令，就会超过一次渲染帧的预算，
+    //   触发 shimmer 卡住 → 渲染事务中止 → 无限重试（历史 bug #21605）。
+    //   把廉价的 env 判断放前面做短路，绝大多数情况下根本不会走到昂贵的沙箱判定。
     return isEnvTruthy(process.env.CLAUDE_CODE_BASH_SANDBOX_SHOW_INDICATOR) && shouldUseSandbox(input) ? 'SandboxedBash' : 'Bash';
   },
   getToolUseSummary(input) {
@@ -521,6 +709,15 @@ export const BashTool = buildTool({
     const desc = input.description ?? truncate(input.command, TOOL_SUMMARY_MAX_LENGTH);
     return `Running ${desc}`;
   },
+  /**
+   * 入参校验（在权限检查**之前**跑）：目前只拦一件事——用 sleep 阻塞主对话。
+   *
+   * 三个前置条件：MONITOR_TOOL 开关打开、后台任务没被全局禁用、且这条命令没有显式后台化。
+   *   （显式 run_in_background 的 sleep 是用户明确要求的，不拦。）
+   *
+   * 返回 { result: false, message, errorCode } 时，模型会收到这段 message 当反馈，
+   *   里面直接告诉它该改用 run_in_background 还是 Monitor。
+   */
   async validateInput(input: BashToolInput): Promise<ValidationResult> {
     if (feature('MONITOR_TOOL') && !isBackgroundTasksDisabled && !input.run_in_background) {
       const sleepPattern = detectBlockedSleepPattern(input.command);
@@ -536,6 +733,9 @@ export const BashTool = buildTool({
       result: true
     };
   },
+  // 权限判定：本文件不写规则，全部委托给 bashPermissions.ts 的 bashToolHasPermission，
+  //   （deny / allow / ask 三态 + 可保存的规则建议都在那里算）。
+  //   返回 ask 时框架会弹权限框。
   async checkPermissions(input, context): Promise<PermissionResult> {
     return bashToolHasPermission(input, context);
   },
@@ -552,6 +752,24 @@ export const BashTool = buildTool({
   }) {
     return stderr ? `${stdout}\n${stderr}` : stdout;
   },
+  /**
+   * 把本工具的出参 Out 转换成要发给模型的 tool_result 内容块。
+   *
+   * 为什么需要这一层：UI 要看的东西（stdout、stderr、图片）和模型要看的东西（可能还要带上
+   *   「大输出已落盘，请用 FileRead 读这个路径」「这条命令已被挪到后台，ID 是 xxx」这类提示）
+   *   并不完全一样。这里是**模型视角**的组装；UI 视角在 BashToolResultMessage.tsx。
+   *
+   * 入参：第一个参数是解构出来的 Out 字段，第二个是 toolUseID（要把结果关联回哪次 tool_use）
+   *
+   * 关键步骤：
+   *   ① 有 structuredContent（结构化内容块）→ 直接原样返回，不做任何字符串加工
+   *   ② 是图片 → 包成 image 内容块；构造失败就往下走，退化成纯文本
+   *   ③ 去掉开头的空行、去掉结尾空白（terminal 输出常见的噪音）
+   *   ④ 大输出已落盘 → 换成 `<persisted-output>` 提示（含前若干字节预览 + 落盘路径 + 总大小）
+   *   ⑤ 被中断 → 追加 `<error>Command was aborted before completion</error>`
+   *   ⑥ 已被后台化 → 追加后台任务 ID 和输出文件路径（分「用户 Ctrl+B」「assistant 自动」两种措辞）
+   *   ⑦ 三段用换行拼起来，空段用 filter(Boolean) 丢掉；is_error 只在被中断时为 true
+   */
   mapToolResultToToolResultBlockParam({
     interrupted,
     stdout,
@@ -574,6 +792,9 @@ export const BashTool = buildTool({
     }
 
     // For image data, format as image content block for Claude
+    // 图片要压一下尺寸再发给模型（CC-304：原图可能巨大，既费 token 又可能被 API 拒收）。
+    //   压失败（解析不了 / 超过体积上限）就把 isImage 置回 false，
+    //   这样 UI 不会标着「图片」却发的是文本——isImage 必须和实际发出的内容保持一致。
     if (isImage) {
       const block = buildImageToolResult(stdout, toolUseID);
       if (block) return block;
@@ -621,9 +842,31 @@ export const BashTool = buildTool({
       is_error: interrupted
     };
   },
+  /**
+   * 工具主体：真正执行 shell 命令，并把结果整理成 Out。
+   *
+   * 入参：
+   *   input —— 校验过的入参；toolUseContext —— 框架上下文（abortController、agentId、setToolJSX…）
+   *   _canUseTool —— 本工具用不到（权限已经先跑过了），下划线前缀表示「故意不用」
+   *   parentMessage —— 当前 assistant 消息（写 undo 历史要用它的 uuid）
+   *   onProgress —— 进度回调，把 runShellCommand 吐出的进度事件转发给框架
+   *
+   * 返回：{ data: Out }；命令失败时**抛** ShellError（由框架转成 is_error 的结果）
+   *
+   * 整体流程：
+   *   ① 模拟 sed 编辑 → 直接落盘返回，不跑 shell
+   *   ② 启动 runShellCommand 异步生成器，用 do/while + await .next() 把它吐的进度转发给 onProgress，
+   *      直到 done；最后那次 .next() 的 value 就是最终 ExecResult
+   *   ③ 语义解释退出码（有些命令退出码非 0 但不算错，见 commandSemantics.ts）
+   *   ④ 大输出落盘持久化（硬链接优先，跨盘则复制；超过 64MB 先截断）
+   *   ⑤ 埋点、剥离 claude-code-hint、图片压缩
+   *   ⑥ 组装 Out 返回
+   */
   async call(input: BashToolInput, toolUseContext, _canUseTool?: CanUseToolFn, parentMessage?: AssistantMessage, onProgress?: ToolCallProgress<BashProgress>) {
     // Handle simulated sed edit - apply directly instead of running sed
     // This ensures what the user previewed is exactly what gets written
+    // 走「预览即所写」的分支：这条 sed 编辑在权限弹窗阶段已经算好结果了，
+    //   这里直接落盘，不再真的启动 sed（避免写进去的和批准的不一致）。
     if (input._simulatedSedEdit) {
       return applySedEdit(input._simulatedSedEdit, toolUseContext, parentMessage);
     }
@@ -639,10 +882,15 @@ export const BashTool = buildTool({
     let progressCounter = 0;
     let wasInterrupted = false;
     let result: ExecResult;
+    // 有没有 agentId 决定是不是「主 agent」：子 agent（subagent）里不允许改当前工作目录，
+    //   否则多个子 agent 并发 cd 会把彼此的工作目录搅乱。
     const isMainThread = !toolUseContext.agentId;
     const preventCwdChanges = !isMainThread;
     try {
       // Use the new async generator version of runShellCommand
+      // 注意这里只**创建**生成器，不 await —— 生成器函数体要等第一次 .next() 才开始执行。
+      //   setAppState 优先用 setAppStateForTasks：这样异步 agent 起的后台 bash 也会被登记，
+      //   agent 退出时才杀得干净。
       const commandGenerator = runShellCommand({
         input,
         abortController,
@@ -679,17 +927,25 @@ export const BashTool = buildTool({
       } while (!generatorResult.done);
 
       // Get the final result from the generator's return value
+      // 生成器 done 时的 value = 函数体里 `return` 出来的 ExecResult（异步生成器的约定）。
       result = generatorResult.value;
       trackGitOperations(input.command, result.code, result.stdout);
       const isInterrupt = result.interrupted && abortController.signal.reason === 'interrupt';
 
       // stderr is interleaved in stdout (merged fd) — result.stdout has both
+      // 为什么只看 stdout：shell 用的是合并 fd，stderr 已经并进 stdout 了，
+      //   所以 result.stderr 基本恒为空，所有输出都从这里取。
+      //   EndTruncatingAccumulator 是「超长时保留尾部」的累加器（错误堆栈通常在最后）。
       stdoutAccumulator.append((result.stdout || '').trimEnd() + EOL);
 
       // Interpret the command result using semantic rules
+      // 语义解释退出码：例如 `grep` 没匹配返回 1 并不算错误。
+      //   把最后一个参数传空字符串，同样是因为 stderr 已并入 stdout，避免重复计算。
       interpretationResult = interpretCommandResult(input.command, result.code, result.stdout || '', '');
 
       // Check for git index.lock error (stderr is in stdout now)
+      // 又一个「stderr 在 stdout 里」的例子：git 的 index.lock 报错走的是 stderr，
+      //   这里只能在合并后的 stdout 里搜。命中就上报一次埋点，用于观察这个问题有多普遍。
       if (result.stdout && result.stdout.includes(".git/index.lock': File exists")) {
         logEvent('tengu_git_index_lock_error', {});
       }
@@ -729,6 +985,9 @@ export const BashTool = buildTool({
     // stdout already contains the first chunk (from getStdout()). Copy the
     // output file to the tool-results dir so the model can read it via
     // FileRead. If > 64 MB, truncate after copying.
+    // 大输出持久化：命令输出已经写到了临时文件（result.outputFilePath），这里把它搬进
+    //   tool-results 目录，模型就能用 FileRead 分段读，不用把几十 MB 塞进上下文。
+    //   64MB 是上限，超过就先截断再搬。
     const MAX_PERSISTED_SIZE = 64 * 1024 * 1024;
     let persistedOutputPath: string | undefined;
     let persistedOutputSize: number | undefined;
@@ -777,11 +1036,16 @@ export const BashTool = buildTool({
     // so the model never sees the tag — a zero-token side channel.
     // Stripping runs unconditionally (subagent output must stay clean too);
     // only the dialog recording is main-thread-only.
+    // claude-code-hint 协议：外部 CLI/SDK 在检测到 CLAUDECODE=1 时，可以往 stderr（这里已并入 stdout）
+    //   吐一个 `<claude-code-hint />` 标签，用来推荐插件等。
+    //   处理方式：先扫出来记录（用于给用户弹推荐），再从输出里**抹掉**——不能让模型看到这个
+    //   零 token 的旁路通道。抹除对所有线程都做（子 agent 的输出也要干净），只有「记录」限主线程。
     const extracted = extractClaudeCodeHints(strippedStdout, input.command);
     strippedStdout = extracted.stripped;
     if (isMainThread && extracted.hints.length > 0) {
       for (const hint of extracted.hints) maybeRecordPluginHint(hint);
     }
+    // 图片输出：命令可能直接往 stdout 吐 base64/原始图片数据。
     let isImage = isImageOutput(strippedStdout);
 
     // Cap image dimensions + size if present (CC-304 — see
@@ -800,6 +1064,10 @@ export const BashTool = buildTool({
         isImage = false;
       }
     }
+    // 组装出参。几个容易看漏的点：
+    //   - 'dangerouslyDisableSandbox' in input 这种 in 判断：因为该字段可能整个不存在，
+    //     直接读 input.dangerouslyDisableSandbox 在 strictObject 下会有类型问题
+    //   - noOutputExpected 交给 isSilentBashCommand 算，UI 据此显示 Done 而不是 (No output)
     const data: Out = {
       stdout: compressedStdout,
       stderr: stderrForShellReset,
@@ -823,6 +1091,26 @@ export const BashTool = buildTool({
     return isOutputLineTruncated(output.stdout) || isOutputLineTruncated(output.stderr);
   }
 } satisfies ToolDef<InputSchema, Out, BashProgress>);
+/**
+ * 执行引擎（异步生成器）：启动 shell 命令，边跑边吐进度，最后 return 出 ExecResult。
+ *
+ * 为什么做成生成器：命令可能跑很久，UI 想每秒看到新输出；生成器天然支持「边跑边 yield」，
+ *   调用方（call 方法）用 `.next()` 取进度、取最终结果，一条链路搞定。
+ *
+ * 入参：input（命令/超时/是否后台）、abortController（取消）、setAppState/setToolJSX（UI 状态）、
+ *       preventCwdChanges（子 agent 禁止 cd）、isMainThread、toolUseId、agentId
+ *
+ * 产出：{ type:'progress', output, fullOutput, elapsedTimeSeconds, totalLines, totalBytes, taskId, timeoutMs }
+ * 最终返回：ExecResult（含 stdout/stderr/code/interrupted/backgroundTaskId…）
+ *
+ * 整体流程：
+ *   ① exec() 起进程，注册 onProgress 回调（由共享 poller 每秒调用，负责唤醒生成器）
+ *   ② 注册三种「后台化」触发：超时兜底、assistant 模式 15 秒预算、用户 Ctrl+B
+ *   ③ 显式 run_in_background → 直接登记成后台任务并立即返回（不等它跑完）
+ *   ④ 先等 2 秒静默期：命令在此期间结束就直接返回，UI 完全不显示进度
+ *   ⑤ 之后进入「进度循环」：Promise.race(命令结束, 进度信号) 谁先到听谁的，
+ *      命令结束 → 返回 ExecResult；进度信号到达 → yield 一次进度
+ */
 async function* runShellCommand({
   input,
   abortController,
@@ -857,6 +1145,8 @@ async function* runShellCommand({
     timeout,
     run_in_background
   } = input;
+  // `||` 在这里是故意的：timeout 为 0 时也算「没传」，用默认值。
+  //   （若用 `??`，显式的 0 会被当成有效值传下去——那意味着「立刻超时」。）
   const timeoutMs = timeout || getDefaultTimeoutMs();
   let fullOutput = '';
   let lastProgressOutput = '';
@@ -867,6 +1157,10 @@ async function* runShellCommand({
 
   // Progress signal: resolved by onProgress callback from the shared poller,
   // waking the generator to yield a progress update.
+  // 「进度信号」的手工实现：一个可以被外部 resolve 的 Promise。
+  //   poller 每秒回调 onProgress，onProgress 里调用 resolveProgress()，
+  //   就能把下面的 Promise.race 唤醒 → 生成器 yield 一次进度。
+  //   Java 视角：相当于自己维护一个 CountDownLatch，每次有新输出就 countDown()。
   let resolveProgress: (() => void) | null = null;
   function createProgressSignal(): Promise<null> {
     return new Promise<null>(resolve => {
@@ -877,7 +1171,11 @@ async function* runShellCommand({
   // Determine if auto-backgrounding should be enabled
   // Only enable for commands that are allowed to be auto-backgrounded
   // and when background tasks are not disabled
+  // 是否允许「自动」后台化：全局开关 + 命令黑名单（比如 sleep）双重判断。
   const shouldAutoBackground = !isBackgroundTasksDisabled && isAutobackgroundingAllowed(command);
+  // 真正 fork 出 bash 进程。第三个参数 'bash' 指定用哪个 shell。
+  //   options 里几件关键的事：timeout（自动后台化的兜底时长）、onProgress（每秒回调）、
+  //   preventCwdChanges（子 agent 禁止 cd）、shouldUseSandbox、shouldAutoBackground。
   const shellCommand = await exec(command, abortController.signal, 'bash', {
     timeout: timeoutMs,
     onProgress(lastLines, allLines, totalLines, totalBytes, isIncomplete) {
@@ -898,6 +1196,8 @@ async function* runShellCommand({
   });
 
   // Start the command execution
+  // 命令的最终结果是一个 Promise，先只**持有**它不 await，
+  //   这样才能和「进度信号」做 Promise.race（谁先完成听谁的）。
   const resultPromise = shellCommand.result;
 
   // Helper to spawn a background task and return its ID
@@ -921,6 +1221,17 @@ async function* runShellCommand({
   }
 
   // Helper to start backgrounding with optional logging
+  /**
+   * 把这条命令挪到后台（三种触发源共用：超时、assistant 预算、Ctrl+B）。
+   *
+   * 关键步骤：
+   *   ① 如果这条命令已经登记成「前台任务」（进度循环里 registerForeground 过），
+   *      就**原地**转成后台任务——重新 spawn 一个新任务会覆盖掉 tasks[taskId]、
+   *      重复发一次 task_started 事件、还会泄漏第一个清理回调
+   *   ② 否则 spawn 一个新的后台任务
+   *   ③ spawn 完成后一定要唤醒一次 Promise.race：否则当 poller 恰好停了、
+   *      而进程又卡在 I/O 上时，race 永远等不到，生成器就死锁了
+   */
   function startBackgrounding(eventName: string, backgroundFn?: (shellId: string) => void): void {
     // If a foreground task is already registered (via registerForeground in the
     // progress loop), background it in-place instead of re-spawning. Re-spawning
@@ -964,6 +1275,7 @@ async function* runShellCommand({
 
   // Set up auto-backgrounding on timeout if enabled
   // Only background commands that are allowed to be auto-backgrounded (not sleep, etc.)
+  // 超时兜底：命令跑满 timeout 还没结束 → 自动挪到后台（不杀进程，用户可以稍后看输出）。
   if (shellCommand.onTimeout && shouldAutoBackground) {
     shellCommand.onTimeout(backgroundFn => {
       startBackgrounding('tengu_bash_command_timeout_backgrounded', backgroundFn);
@@ -973,6 +1285,8 @@ async function* runShellCommand({
   // In assistant mode, the main agent should stay responsive. Auto-background
   // blocking commands after ASSISTANT_BLOCKING_BUDGET_MS so the agent can keep
   // coordinating instead of waiting. The command keeps running — no state loss.
+  // assistant 模式专用：主 agent 不能被一条慢命令卡死，超过预算（15s）就自动后台化。
+  //   命令继续跑，状态不丢。`.unref()` 让这个定时器不阻止进程退出。
   if (feature('KAIROS') && getKairosActive() && isMainThread && !isBackgroundTasksDisabled && run_in_background !== true) {
     setTimeout(() => {
       if (shellCommand.status === 'running' && backgroundShellId === undefined) {
@@ -986,6 +1300,8 @@ async function* runShellCommand({
   // When explicitly requested via run_in_background, always honor the request
   // regardless of the command type (isAutobackgroundingAllowed only applies to automatic backgrounding)
   // Skip if background tasks are disabled - run in foreground instead
+  // 显式后台化：模型/用户在入参里明确要求了，那就无条件照办（不受 isAutobackgroundingAllowed 限制），
+  //   登记完立刻返回，不等命令跑完。用 `=== true` 而不是真值判断，是为了和 undefined 区分开。
   if (run_in_background === true && !isBackgroundTasksDisabled) {
     const shellId = await spawnBackgroundTask();
     logEvent('tengu_bash_command_explicitly_backgrounded', {
@@ -1001,6 +1317,9 @@ async function* runShellCommand({
   }
 
   // Wait for the initial threshold before showing progress
+  // 2 秒静默期：先 race(命令结束, 2 秒定时器)。
+  //   命令在 2 秒内结束 → 直接返回，UI 完全不显示进度（避免闪烁）；
+  //   2 秒到了还没结束 → 才启动 poller、进入下面的进度循环。
   const startTime = Date.now();
   let foregroundTaskId: string | undefined = undefined;
   {
@@ -1026,13 +1345,19 @@ async function* runShellCommand({
 
   // Start polling the output file for progress. The poller's #tick calls
   // onProgress every second, which resolves progressSignal below.
+  // 开始每秒轮询输出文件。poller 的 tick 会调用上面注册的 onProgress，进而唤醒进度信号。
+  //   注意：这是**共享** poller，多个后台任务共用一个定时器，避免 N 个任务 N 个定时器。
   TaskOutput.startPolling(shellCommand.taskOutput.taskId);
 
   // Progress loop: wake is driven by the shared poller calling onProgress,
   // which resolves the progressSignal.
   try {
+    // 进度循环：每轮都新建一个进度信号，然后 race(命令结束, 进度信号)。
+    //   命令结束 → 上面的分支 return；进度信号先到 → 走到循环体末尾 yield 一次进度。
     while (true) {
       const progressSignal = createProgressSignal();
+      // race 的结果是**有类型的**：`result !== null` 说明是命令结束了（ExecResult），
+      //   `=== null` 说明只是进度信号被唤醒了。用 null 当「哨兵值」区分两种唤醒来源。
       const result = await Promise.race([resultPromise, progressSignal]);
       if (result !== null) {
         // Race: backgrounding fired (15s timer / onTimeout / Ctrl+B) but the
@@ -1044,6 +1369,13 @@ async function* runShellCommand({
         // redundant <task_notification> from the .then() handler.
         // Check result.backgroundTaskId (not the closure var) to also cover
         // Ctrl+B, which calls shellCommand.background() directly.
+        // 竞态修补：后台化已经触发（15s 定时器 / onTimeout / Ctrl+B），但命令紧接着就跑完了。
+        //   此时 #handleExit 因为「已后台化」而跳过了 outputFilePath 的填写，
+        //   这里要补三件事：① 把 backgroundTaskId 抹掉（让模型看到一条干净的正常结束命令）
+        //   ② 按 taskOutput 重建 outputFilePath 等字段（大输出才不会丢）
+        //   ③ 标记任务已通知，避免再发一条多余的 <task_notification>
+        //   判断用的是 result.backgroundTaskId（结果里的）而不是闭包变量，
+        //   这样才能覆盖「Ctrl+B 直接调 shellCommand.background()」这条路径。
         if (result.backgroundTaskId !== undefined) {
           markTaskNotified(result.backgroundTaskId, setAppState);
           const fixedResult: ExecResult = {
@@ -1075,6 +1407,7 @@ async function* runShellCommand({
       }
 
       // Check if command was backgrounded (either via old mechanism or new backgroundAll)
+      // 已经被后台化 → 返回空输出 + 后台任务 ID（真正的输出稍后由任务通知带给模型）。
       if (backgroundShellId) {
         return {
           stdout: '',
@@ -1087,6 +1420,8 @@ async function* runShellCommand({
       }
 
       // Check if this foreground task was backgrounded via backgroundAll()
+      // 用户按 Ctrl+B 把这条前台命令转成后台任务：shellCommand.status 会变成 'backgrounded'，
+      //   这里据此返回，并打上 backgroundedByUser 标记（UI/模型提示的措辞会不一样）。
       if (foregroundTaskId) {
         // shellCommand.status becomes 'backgrounded' when background() is called
         if (shellCommand.status === 'backgrounded') {
@@ -1124,6 +1459,8 @@ async function* runShellCommand({
           showSpinner: true
         });
       }
+      // 吐一次进度。timeoutMs 用条件展开 `...(cond ? { k: v } : {})`：
+      //   只有用户显式传了 timeout 才带上这个字段（Java 视角：可选字段，没有就不放进 map）。
       yield {
         type: 'progress',
         fullOutput,

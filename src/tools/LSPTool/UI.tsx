@@ -1,3 +1,146 @@
+/**
+ * ============================================================================
+ *  【文件总览】src/tools/LSPTool/UI.tsx —— LSP 工具在终端里长什么样
+ * ============================================================================
+ *
+ *  ★★ 读这个文件前必须先知道的一件事 ★★
+ *
+ *  本文件是 **React Compiler 编译后的产物**，不是人手写的代码。
+ *  真正的源码在同目录的 `UI.tsx`（同名），编译后生成你现在看到的这份。
+ *  证据有三处：
+ *    ① 第 1 行 `import { c as _c } from "react/compiler-runtime"`（编译器注入的运行时）
+ *    ② 函数体里到处是 `const $ = _c(24)` 和 `$[0]` `$[1]` 这种**缓存槽位**读写
+ *    ③ 末尾有一大串 `//# sourceMappingURL=data:application/json;base64,...`
+ *       （把编译后代码映射回原始源码的 sourcemap，就贴在同一行里）
+ *
+ *  所以：**不要手工编辑本文件**（下次编译会被覆盖），要改就改源码再重新编译。
+ *  下面那些 `$[0] !== operation` 的判断，是编译器自动插入的
+ *  「这个值变没变？没变就复用上次的缓存」逻辑，等价于手写的 useMemo。
+ *
+ * ---------------------------------------------------------------------------
+ *  【一句话定位】
+ *  ---------------------------------------------------------------------------
+ *  把 LSP 工具的执行过程画到终端上，三种时机：
+ *    renderToolUseMessage()       工具**即将**被调用时：`LSP(operation: "hover", symbol: "foo", in: "src/a.ts")`
+ *    renderToolUseErrorMessage()  工具调用**失败**时：`LSP operation failed`
+ *    renderToolResultMessage()    工具**返回**后：`Found 42 references across 7 files` （+ Ctrl+O 可展开）
+ *
+ * ---------------------------------------------------------------------------
+ *  【在架构中的位置】
+ *  ---------------------------------------------------------------------------
+ *      src/tools/LSPTool/LSPTool.ts
+ *        ├─ userFacingName()              ← ★ 本文件（工具显示名 'LSP'）
+ *        ├─ renderToolUseMessage()        ← ★ 本文件
+ *        ├─ renderToolUseErrorMessage()   ← ★ 本文件
+ *        └─ renderToolResultMessage()     ← ★ 本文件
+ *              └─ LSPResultSummary（本文件内部组件）
+ *                    └─ getSymbolAtPosition() ← src/tools/LSPTool/symbolContext.ts
+ *                                              （把行号列号换成实际的符号名，更好读）
+ *
+ *  分层提醒（LSP 目录通用）：
+ *      本文件           ≈ View 层（只管画）
+ *      LSPTool.ts       ≈ Controller（校验 + 编排）
+ *      src/services/lsp ≈ Service（真正跟 language server 对话）
+ *
+ * ---------------------------------------------------------------------------
+ *  【本文件包含什么】
+ *  ---------------------------------------------------------------------------
+ *   OPERATION_LABELS     9 种 operation 各自的单/复数文案（definition/definitions…）
+ *   LSPResultSummary     内部组件：结果的「折叠态 / 展开态」两种渲染
+ *   userFacingName()     工具显示名常量 'LSP'
+ *   renderToolUseMessage()       渲染「即将调用」
+ *   renderToolUseErrorMessage()  渲染「调用失败」
+ *   renderToolResultMessage()    渲染「结果」
+ *
+ * ---------------------------------------------------------------------------
+ *  【折叠（collapse）是什么？本文件的核心概念】
+ *  ---------------------------------------------------------------------------
+ *  LSP 结果可能很长（几百行引用），全打出来会把终端刷爆、也浪费上下文。
+ *  所以默认只显示**一行摘要**：
+ *
+ *      ⎿  Found 42 references across 7 files   ← 折叠态（height={1}，只占一行）
+ *
+ *  用户按 Ctrl+O 才展开看全文（CtrlOToExpand 组件就是那个提示）。
+ *  而 `verbose` 参数为 true 时直接展开（对应 `--verbose` 之类的模式）。
+ *
+ * ---------------------------------------------------------------------------
+ *  【TS / TSX 语法速查（Java 工程师视角）】
+ *  ---------------------------------------------------------------------------
+ *   - `.tsx` 后缀          表示这个文件里可以写 **JSX**（HTML 一样的标签语法）。
+ *                          ≈ Java 没有；想象成在代码里直接写 XML 来描述界面。
+ *
+ *   - JSX：`<Text bold={true}>{n} </Text>`
+ *                          ≈ Android 的 XML 布局 + 数据绑定，但它是**真代码**：
+ *                          大括号 `{}` 里可以写任意 JS 表达式。
+ *                          `<Box flexDirection="row">` 里那些属性就是组件的 props
+ *                          （≈ 构造参数 /  setter）。
+ *
+ *   - `React.ReactNode`    组件函数的返回类型：可以是一个元素、字符串、null、或数组。
+ *                          ≈ Java 的 `Object`（很宽泛），但语义上是「可渲染的东西」。
+ *                          注意 `renderToolUseMessage` 里 `return ''` 和 `return null`
+ *                          都合法 —— 表示「什么都不画」。
+ *
+ *   - `Partial<Input>`     把 Input 的每个字段都变成**可选**。
+ *                          ≈ Java 里再写一个所有字段可空的 DTO。
+ *                          为什么这里要用 Partial？因为工具刚被模型请求时，
+ *                          参数可能还没解析完整（流式到达），渲染函数必须能容错。
+ *
+ *   - `Record<Input['operation'], {...}>`
+ *                          映射类型：以 operation 的 9 个字面量为**全部** key。
+ *                          ≈ `EnumMap`，且编译器保证**一个 key 都不能少**
+ *                          （少写一个就报错）。这是类型系统带来的安全感。
+ *
+ *   - `OPERATION_LABELS[operation] || { singular: 'result', plural: 'results' }`
+ *                          `||` 兜底：万一 operation 是个没预料到的值（防御外部输入）。
+ *                          ⚠️ 与 `??` 的区别见 formatters.ts 的说明。
+ *
+ *   - `resultCount === 1 ? labelConfig.singular : labelConfig.plural`
+ *                          三元运算符处理**单复数**。英语里 "1 reference" / "2 references"
+ *                          必须区分，否则模型和用户都会觉得别扭。
+ *
+ *   - `<Text>{" "}across <Text bold={true}>{fileCount} </Text>files</Text>`
+ *                          `{" "}` 是**显式空格**。为什么不能直接打空格？
+ *                          因为 JSX 会把换行和多余空白吃掉，想要一个确定的空格
+ *                          就得写成 `{" "}`。这是 JSX 的经典小坑。
+ *
+ *   - `resultCount > 0 && <CtrlOToExpand />`
+ *                          `&&` 短路：条件为 false 时渲染**nothing**。
+ *                          ≈ Java 里 `cond ? component : null`，这是 React 的惯用写法。
+ *                          注意：如果左边是数字 0，JSX 会真的把 "0" 显示出来 ——
+ *                          所以严谨写法是 `resultCount > 0 &&`（本文件正是这么做的）。
+ *
+ *   - `fileCount > 1 ? <Text>...</Text> : null`
+ *                          只有跨多个文件才显示 "across N files"；
+ *                          1 个文件时说 "across 1 files" 语法错误且冗余。
+ *
+ *   - `Symbol.for("react.memo_cache_sentinel")`
+ *                          React Compiler 用来标记「这个缓存槽还没写过」的哨兵值。
+ *                          ≈ Java 里用 `null` 表示未初始化，但这里不能用 null，
+ *                          因为缓存的值**本身**可能就是 null（比如 t3 = null）。
+ *                          这是编译产物特有的写法，手写代码里不会出现。
+ *
+ *   - `bb0: { ... break bb0 }`  带标签的块 + break（goto 的结构化版本）。
+ *                          Java 也有 label（但极少用）。这里是编译器用来实现
+ *                          「提前 return」的：break 出块后继续执行后面的逻辑。
+ *
+ *   - `.map(([key, value]) => ...)`  数组 map，回调参数用**数组解构**。
+ *                          ≈ Java 的 stream().map(e -> f(e.getKey(), e.getValue()))。
+ *
+ *   - `parts.join(', ')`  把字符串数组用逗号连起来。
+ *                          ≈ Java 的 String.join(", ", parts)。
+ *
+ *   - `const { verbose }: { verbose: boolean }`
+ *                          **参数解构 + 类型标注**：直接从第一个参数里取出 verbose，
+ *                          同时声明这个参数对象的类型。
+ *                          ≈ Java 里 `void f(Options o)` 然后 `o.isVerbose()`，
+ *                          但 TS 一步到位。
+ *
+ *   - `extractTag(result, 'tool_use_error')`
+ *                          从可能带 XML 标签的错误文本里抠出指定标签的内容。
+ *                          非 verbose 模式下只显示一句简短的 'LSP operation failed'，
+ *                          详细堆栈要 verbose 才展开 —— 避免刷屏。
+ */
+
 import { c as _c } from "react/compiler-runtime";
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs';
 import React from 'react';
@@ -11,6 +154,16 @@ import type { Input, Output } from './LSPTool.js';
 import { getSymbolAtPosition } from './symbolContext.js';
 
 // Lookup map for operation-specific labels
+// 【中文补充】9 种 operation 各自的「单/复数说法」，用于拼出
+//   "Found 1 reference"  /  "Found 42 references"
+// 英语必须区分单复数，所以用一张表预先备好两种形式。
+//
+// `Record<Input['operation'], {...}>` 的妙处：编译器会检查**9 个 key 一个都不能少**，
+// 将来 LSPTool 新增一种 operation 却忘了在这里加文案，编译期就报错（≈ EnumMap + 穷尽检查）。
+//
+// hover 比较特殊：它不是「找到了 N 个东西」，而是「有没有信息」，
+// 所以它额外有一个 `special: 'available'` 字段，最终渲染成
+//   "Hover info available"（而不是别扭的 "Found 1 hover info"）。
 const OPERATION_LABELS: Record<Input['operation'], {
   singular: string;
   plural: string;
@@ -56,6 +209,23 @@ const OPERATION_LABELS: Record<Input['operation'], {
 };
 
 /**
+ * 【中文补充】LSP 结果的「摘要组件」，支持折叠 / 展开两种形态。
+ *
+ * 折叠态（verbose = false）：只占一行，末尾挂一个 Ctrl+O 提示
+ *     ⎿  Found 42 references across 7 files   ← Ctrl+O 可展开
+ *   为什么只占一行？因为 LSP 结果动辄上百行，全打出来会刷屏、
+ *   也会把大量文本塞进上下文。默认给摘要，用户想看再展开。
+ *
+ * 展开态（verbose = true）：把完整内容原样输出（缩进 5 格对齐）
+ *     ⎿  Found 42 references across 7 files
+ *        src/a.ts:
+ *          Line 12:5
+ *          ...
+ *
+ * 参数里的 resultCount / fileCount 来自 LSPTool.ts 的 formatResult()，
+ * 只有**成功**路径才会带上；出错时是 undefined，于是在
+ * renderToolResultMessage 里走另一条兜底分支（见下方说明）。
+ *
  * Reusable component for LSP result summaries with collapsed/expanded views
  */
 function LSPResultSummary(t0) {
@@ -157,9 +327,42 @@ function LSPResultSummary(t0) {
   }
   return t5;
 }
+/**
+ * 【中文补充】工具在 UI 上显示的名字。
+ *
+ * 为什么要有这个（而不是直接用 name）？因为内部工具名（'LSP'）和
+ * 给用户看的名字可能需要不同大小写/措辞，拆开一个函数方便单独调整。
+ * 这里两者恰好相同。
+ *
+ * 注意它是 `() => 'LSP'` 而不是常量字符串：Tool 接口规定这是个**函数**，
+ * 因为有些工具的名字要随上下文变化（比如 MCP 工具带 server 名）。
+ */
 export function userFacingName(): string {
   return 'LSP';
 }
+/**
+ * 【中文补充】渲染「工具即将被调用」那一行，例如：
+ *     LSP(operation: "goToDefinition", symbol: "handleClick", in: "src/a.ts")
+ *
+ * 为什么不直接打印 `position: 42:13`？因为人看坐标毫无感觉，
+ * 而看到 symbol 名立刻知道模型在查什么。所以对于**依赖光标位置**的 4 种
+ * operation，会去文件里把那个位置的标识符抠出来（getSymbolAtPosition）。
+ *
+ * 抠不到（返回 null，比如文件太大、越界、该位置是空白）就**降级**显示坐标，
+ * 绝不因为显示问题让工具调不起来。
+ *
+ * 关键细节：`input.line - 1` / `input.character - 1` ——
+ *   工具的入参是 1-based（编辑器那样），而读文件用的是 0-based 数组下标，
+ *   这里做一次换算。与 LSPTool.ts 里发给 LSP 前的 -1 是**同一套**坐标约定。
+ *
+ * 另外 `Partial<Input>`：参数可能不完整（流式解析中），所以每个字段都要判空。
+ *
+ * documentSymbol / workspaceSymbol 不需要位置，走下面那段更简单的分支。
+ *
+ * @param input   模型填的入参（可能不完整）
+ * @param verbose true 时显示完整绝对路径；false 时显示相对/缩写路径（getDisplayPath）
+ * @returns 一行文本，或 null（连 operation 都没有时）
+ */
 export function renderToolUseMessage(input: Partial<Input>, {
   verbose
 }: {
@@ -197,6 +400,23 @@ export function renderToolUseMessage(input: Partial<Input>, {
   }
   return parts.join(', ');
 }
+/**
+ * 【中文补充】渲染「工具调用失败」那一行。
+ *
+ * 为什么要分 verbose / 非 verbose 两种？
+ *   非 verbose：只显示一句 `LSP operation failed`。
+ *     完整的报错（可能带 XML 标签、堆栈、多行）会刷屏，
+ *     而用户此时只需要知道「失败了」；详细内容模型那边已经有了。
+ *   verbose：原样交给 FallbackToolUseErrorMessage 全量展开，方便排查。
+ *
+ * `extractTag(result, 'tool_use_error')` 的作用：判断这段报错里到底**有没有**
+ * tool_use_error 标签的内容。没有的话（比如结果是别的结构）就别显示那句
+ * 干巴巴的 "failed"，直接走 fallback 全量渲染更诚实。
+ *
+ * @param result  失败信息（可能是字符串，也可能是结构化的 content 块）
+ * @param verbose 是否展开详细信息
+ * @returns React 元素
+ */
 export function renderToolUseErrorMessage(result: ToolResultBlockParam['content'], {
   verbose
 }: {
@@ -209,6 +429,24 @@ export function renderToolUseErrorMessage(result: ToolResultBlockParam['content'
   }
   return <FallbackToolUseErrorMessage result={result} verbose={verbose} />;
 }
+/**
+ * 【中文补充】渲染「工具返回后」的结果。
+ *
+ * ★ 这里有一个容易忽略但很重要的分支条件：
+ *     `output.resultCount !== undefined && output.fileCount !== undefined`
+ *
+ *   这两个字段只有在**成功路径**下才会被填上（见 LSPTool.ts 的 formatResult）。
+ *   而出错时（manager 没初始化、文件太大、请求抛异常）Output 里只有 result 文案，
+ *   没有计数 —— 于是走下面那条**兜底分支**，直接把 result 原样显示出来。
+ *
+ *   也就是说：**「有没有计数」被当成了「成功还是失败」的判别标志**。
+ *   这是个隐式约定，改动 LSPTool.ts 的 Output 时别破坏它。
+ *
+ * @param output            工具的 Output（LSPTool.ts 里定义的那个）
+ * @param _progressMessages 进度消息（LSP 工具不发进度，故忽略；下划线前缀即此意）
+ * @param verbose           是否展开完整内容
+ * @returns React 元素
+ */
 export function renderToolResultMessage(output: Output, _progressMessages: unknown[], {
   verbose
 }: {

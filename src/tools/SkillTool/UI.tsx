@@ -1,3 +1,89 @@
+/**
+ * ============================================================================
+ *  【文件总览】src/tools/SkillTool/UI.tsx —— Skill 工具的「终端渲染层」
+ * ============================================================================
+ *
+ *  【一句话定位】
+ *  本文件只管**怎么把 Skill 工具画到终端上**，不含任何业务逻辑。
+ *  它导出一组 render* 函数，被 SkillTool.ts 以配置项的形式挂上去
+ *  （见 SkillTool.ts 末尾的 renderToolResultMessage / renderToolUseMessage 等）。
+ *
+ *  【在架构中的位置】
+ *
+ *      模型请求调用 Skill 工具
+ *        └─> SkillTool.call()                    ← src/tools/SkillTool/SkillTool.ts
+ *              └─> 拿到 Output 后交给渲染层
+ *                    └─> renderToolResultMessage(...)   ← ★ 本文件
+ *                          └─> <MessageResponse> / <Byline>   ← src/components/**
+ *                                └─> Ink 把 React 元素画成终端字符
+ *
+ *      fork 模式下子 agent 的每一步进度：
+ *        └─> SkillTool.call() 里的 onProgress(...)
+ *              └─> renderToolUseProgressMessage(...)    ← ★ 本文件
+ *
+ *  为什么要单独拆一个 UI 文件？这是**关注点分离**：
+ *  SkillTool.ts 关心"skill 怎么执行"，UI.tsx 关心"长什么样"。
+ *  这样同一份逻辑可以有不同呈现（比如 JSON 输出模式就不走这些函数）。
+ *
+ *  【本文件包含什么】（5 个渲染函数，一一对应工具的 5 种状态）
+ *   1. renderToolResultMessage()       成功结果：`Successfully loaded skill`
+ *   2. renderToolUseMessage()          工具被调用时显示的名字（/pdf 还是 pdf）
+ *   3. renderToolUseProgressMessage()  执行中：展示子 agent 的进度消息
+ *   4. renderToolUseRejectedMessage()  用户拒绝：进度 + 拒绝提示
+ *   5. renderToolUseErrorMessage()     执行失败：进度 + 错误提示
+ *
+ * ---------------------------------------------------------------------------
+ *  【TS / TSX 语法速查】（针对本文件实际出现的语法）
+ * ---------------------------------------------------------------------------
+ *   - 文件名 `.tsx` 而不是 `.ts`：**因为里面有 JSX**。
+ *     JSX 就是可以在代码里直接写 `<Box><Text>hi</Text></Box>`
+ *     ≈ Java 里没有；想象成在代码里写 XML/HTML 字面量，
+ *     编译后会变成 `React.createElement(...)` 调用。
+ *
+ *   - `React.ReactNode`  返回值类型 = "任何可以被 React 渲染的东西"
+ *     （元素、字符串、null、数组都行）≈ Java 的 Object，但专用于渲染。
+ *     注意 renderToolUseMessage 返回 `null` 是合法的，表示"什么都不画"。
+ *
+ *   - `Partial<Input>`  **工具类型（utility type）**：把 Input 的所有字段
+ *     变成可选。≈ Java 没有；想象成生成一个所有字段都可空的新 DTO。
+ *     为什么这里用 Partial？因为工具调用刚发起时，模型给的参数可能
+ *     还没解析完整（流式），字段可能缺失。
+ *
+ *   - `z.infer<ReturnType<typeof inputSchema>>`
+ *     **类型层面的"反向推导"**：从 zod schema 反向推出 TS 类型。
+ *     ≈ Java 里靠注解处理器生成 DTO；TS 里纯靠类型系统，运行时零成本。
+ *     这样 schema 改了，类型自动跟着变，不用两处维护。
+ *
+ *   - 解构参数 + 类型标注写在一起：
+ *         function f({ skill }: Partial<Input>, { commands }: { commands?: Command[] })
+ *     ≈ Java 里没有"解构参数"，只能 `f(Map<String,Object> opts)` 再 get。
+ *     注意第二个参数也是对象解构，所以整个函数实际只接 2 个参数。
+ *
+ *   - `progressMessages.slice(-3)`  **负索引**取得最后 3 个元素
+ *     ≈ Java 的 `list.subList(size-3, size)`；TS/Python 都支持这种写法。
+ *
+ *   - `'status' in output`  **in 运算符做类型收窄**：
+ *     Output 是联合类型（inline 结果 | forked 结果），
+ *     用 in 判断某个字段是否存在后，TS 就知道是哪一个分支了
+ *     ≈ Java `if (o instanceof ForkedOutput f)`。
+ *
+ *   - `<>...</>`  **Fragment（片段）**：一个不产生真实节点的包裹容器，
+ *     用于一次返回多个并列元素 ≈ JavaFX 里没有，但类似"虚拟父节点"。
+ *
+ *   - `{hiddenCount > 0 && <Text .../>}`  JSX 里用 `&&` 做条件渲染。
+ *     原理：`false && x` 得到 false，而 React 渲染 false 等于什么都没有。
+ *     （⚠️ 坑：如果左边是 0，`0 && x` 得到 0，React 会把 "0" 画出来！
+ *       所以严谨写法是 `hiddenCount > 0 && ...`，本文件正是这么写的。）
+ *
+ *   - `.map(pm => ...)` 返回 JSX 数组时，每个元素必须带 `key` 属性
+ *     （React 用来做最小化重绘的标识）≈ Java 里给列表项一个稳定 id。
+ *
+ *   - `as const`：见 SkillTool.ts；`type X as const` 让字面量类型不被放宽。
+ *
+ *   - 文件末尾那串 `//# sourceMappingURL=data:...` 是**内联 sourcemap**，
+ *     把编译后代码映射回原始 .tsx 源码，方便调试。不是业务代码，忽略即可。
+ * ============================================================================
+ */
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs';
 import * as React from 'react';
 import { SubAgentProvider } from 'src/components/CtrlOToExpand.js';
@@ -15,10 +101,32 @@ import { buildSubagentLookups, EMPTY_LOOKUPS } from '../../utils/messages.js';
 import { plural } from '../../utils/stringUtils.js';
 import type { inputSchema, Output, Progress } from './SkillTool.js';
 type Input = z.infer<ReturnType<typeof inputSchema>>;
+// 非 verbose 模式下最多显示几条子 agent 的进度消息。
+// 为什么要限制？终端屏幕高度有限，而且 fork 模式的 skill 可能跑几十步，
+// 全部画出来会把用户的滚屏历史冲掉。
 const MAX_PROGRESS_MESSAGES_TO_SHOW = 3;
+// 还没有任何进度消息时显示的占位文案（子 agent 刚启动、还没吐出东西）
 const INITIALIZING_TEXT = 'Initializing…';
+
+/**
+ * 渲染 Skill 工具**执行成功**后的那一行结果。
+ *
+ * 为什么需要：工具跑完了得给用户一个可见的交代。这里按执行模式分成两种：
+ *   - forked（在子 agent 里跑的）：只显示 `Done`，因为详细过程已经在
+ *     进度消息里实时展示过了，再重复一遍没意义；
+ *   - inline（把提示词直接注入当前对话）：显示
+ *     `Successfully loaded skill`，并附上这次允许了哪些工具、用了哪个 model。
+ *
+ * 入参/返回：
+ * @param output SkillTool.call() 返回的数据（inline 或 forked 两种形态）
+ * @returns 一个 React 节点，交给 Ink 渲染成终端字符
+ */
 export function renderToolResultMessage(output: Output): React.ReactNode {
   // Handle forked skill result
+  // 中文补充：`'status' in output` 是在**辨别联合类型的分支**。
+  // Output = inline 结果 | forked 结果，两者字段不同；
+  // 判断 status 字段存在后，TS 才允许你访问 output.result。
+  // ≈ Java 的 if (o instanceof ForkedOutput f) { ... }
   if ('status' in output && output.status === 'forked') {
     return <MessageResponse height={1}>
         <Text>
@@ -26,15 +134,24 @@ export function renderToolResultMessage(output: Output): React.ReactNode {
         </Text>
       </MessageResponse>;
   }
+  // 中文补充：用数组收集要展示的"标签"，最后统一交给 <Byline> 排版。
+  // Byline 是设计系统里的"一行小字"组件（类似命令行工具的状态栏）。
   const parts: string[] = ['Successfully loaded skill'];
 
   // Show tools count (only for inline skills)
+  // 中文补充：skill 可以在 frontmatter 里声明 allowed-tools，
+  // 加载后这些工具会被临时加进白名单。这里告诉用户"放开了哪些权限"，
+  // 属于安全透明度——用户应该看得见 skill 给自己加了什么能力。
   if ('allowedTools' in output && output.allowedTools && output.allowedTools.length > 0) {
     const count = output.allowedTools.length;
+    // 中文补充：plural(count, 'tool') 会按数量返回 'tool' 或 'tools'。
+    // 英文有单复数变化，所以需要一个专门的辅助函数；中文就不需要。
     parts.push(`${count} ${plural(count, 'tool')} allowed`);
   }
 
   // Show model if non-default (only for inline skills)
+  // 中文补充：skill 可以指定用别的模型跑（比如 heavy 任务指定 opus）。
+  // 只在**非默认**时才显示，避免每回都刷一遍无信息量的默认名。
   if ('model' in output && output.model) {
     parts.push(output.model);
   }
@@ -44,6 +161,19 @@ export function renderToolResultMessage(output: Output): React.ReactNode {
       </Text>
     </MessageResponse>;
 }
+/**
+ * 渲染 Skill 工具**被调用时**显示的名字。
+ *
+ * 为什么需要：模型请求一次 Skill 调用时，终端要显示"正在执行 xxx"。
+ * 这里有个历史包袱要处理：老版本 Claude Code 的自定义命令放在
+ * `.claude/commands/` 目录里，用户习惯写成 `/foo`（带斜杠）；
+ * 新版 skill 不带斜杠。为了不破坏老用户的肌肉记忆，
+ * 来自废弃目录的命令仍然显示成 `/foo`。
+ *
+ * @param input 工具入参（Partial：流式解析时字段可能还没齐）
+ * @param opts.commands 当前可用命令列表，用来反查这个 skill 的来源
+ * @returns 要显示的字符串；skill 名为空时返回 null（什么都不显示）
+ */
 export function renderToolUseMessage({
   skill
 }: Partial<Input>, {
@@ -51,14 +181,40 @@ export function renderToolUseMessage({
 }: {
   commands?: Command[];
 }): React.ReactNode {
+  // 中文补充：skill 还没解析出来就先不画。返回 null 在 React 里是合法的
+  // "什么都不渲染"，比返回空字符串更明确。
   if (!skill) {
     return null;
   }
   // Look up the command to check if it came from the legacy /commands folder
+  // 中文补充：`commands?.find(...)` 的 ?. 是可选链：commands 可能没传，
+  // 不写 ?. 会在 undefined 上调 .find() 直接崩。
+  // ≈ Java 的 `commands != null ? commands.stream().filter(...) : null`
   const command = commands?.find(c => c.name === skill);
+  // 中文补充：loadedFrom === 'commands_DEPRECATED' 标记"来自已废弃的旧目录"。
+  // 只有这批老命令才补上斜杠前缀 —— 兼容老习惯，同时不污染新 skill 的显示。
   const displayName = command?.loadedFrom === 'commands_DEPRECATED' ? `/${skill}` : skill;
   return displayName;
 }
+/**
+ * 渲染 Skill **执行过程中**的进度（fork 模式下子 agent 的每一步）。
+ *
+ * 为什么需要：fork 模式的 skill 是在一个独立子 agent 里跑的，
+ * 可能持续几十秒、调用几十次工具。必须实时把子 agent 的动向透出来，
+ * 否则用户会以为卡死了。
+ *
+ * 关键步骤：
+ *   ① 一条进度都没有 → 显示 `Initializing…`（子 agent 刚起步）；
+ *   ② 非 verbose 模式只取**最后 3 条**（老的会被滚上去看不见，留着也没意义），
+ *     并算出"还藏了几条"；verbose 模式则全量展示；
+ *   ③ 用 buildSubagentLookups 算出哪些工具调用还在进行中（要显示转圈动画）；
+ *   ④ 逐条渲染成"精简版"消息行（style="condensed"），最后补一行 `+N more`。
+ *
+ * @param progressMessages 累积到的进度消息（每条裹着子 agent 的一条消息）
+ * @param opts.tools 工具注册表，渲染子消息时需要知道每个工具怎么画
+ * @param opts.verbose 是否全量展开
+ * @returns React 节点
+ */
 export function renderToolUseProgressMessage(progressMessages: ProgressMessage<Progress>[], {
   tools,
   verbose
@@ -66,6 +222,8 @@ export function renderToolUseProgressMessage(progressMessages: ProgressMessage<P
   tools: Tools;
   verbose: boolean;
 }): React.ReactNode {
+  // 中文补充：一个进度都还没有 —— 子 agent 刚被拉起来，还没吐出任何东西。
+  // 这时给个占位文案，比空白更能安抚用户（"它在动，只是还没产出"）。
   if (!progressMessages.length) {
     return <MessageResponse height={1}>
         <Text dimColor>{INITIALIZING_TEXT}</Text>
@@ -73,8 +231,14 @@ export function renderToolUseProgressMessage(progressMessages: ProgressMessage<P
   }
 
   // Take only the last few messages for display in non-verbose mode
+  // 中文补充：slice(-3) 取最后 3 条 —— 负索引是 TS/Python 的便利语法，
+  // Java 得写 list.subList(Math.max(0, size-3), size)。
   const displayedMessages = verbose ? progressMessages : progressMessages.slice(-MAX_PROGRESS_MESSAGES_TO_SHOW);
   const hiddenCount = progressMessages.length - displayedMessages.length;
+  // 中文补充：buildSubagentLookups 会扫一遍全部进度消息，
+  // 找出"发起了但还没返回结果"的 tool_use id 集合 —— 有了它，
+  // 渲染时才知道哪一行要显示"进行中"的转圈动画。
+  // 注意这里传的是**完整列表**而不是裁剪后的，否则正在跑的老调用会被误判为已完成。
   const {
     inProgressToolUseIDs
   } = buildSubagentLookups(progressMessages.map(pm => pm.data));
@@ -91,6 +255,20 @@ export function renderToolUseProgressMessage(progressMessages: ProgressMessage<P
       </Box>
     </MessageResponse>;
 }
+/**
+ * 渲染 Skill **被用户拒绝**时的画面。
+ *
+ * 为什么需要：用户在权限弹窗里点了 No，得明确显示"这次调用没执行"。
+ * 但拒绝不等于"什么都没发生"——fork 模式下子 agent 可能已经跑了几步，
+ * 所以这里**先复用进度渲染**把已发生的过程展示出来，再追加一行拒绝提示。
+ * 这样用户能看到"我是在第 3 步叫停的"，而不是一片空白。
+ *
+ * @param _input 工具入参；下划线前缀 = 这里用不到（拒绝画面不需要展示参数）
+ * @param opts.progressMessagesForMessage 这条工具调用累积到的进度消息
+ * @param opts.tools 工具注册表
+ * @param opts.verbose 是否全量展开
+ * @returns React 节点
+ */
 export function renderToolUseRejectedMessage(_input: Input, {
   progressMessagesForMessage,
   tools,
@@ -108,6 +286,19 @@ export function renderToolUseRejectedMessage(_input: Input, {
       <FallbackToolUseRejectedMessage />
     </>;
 }
+/**
+ * 渲染 Skill **执行失败**时的画面。
+ *
+ * 为什么需要：与"被拒绝"同理——失败也可能发生在子 agent 跑了若干步之后，
+ * 只显示一个错误会让用户失去上下文。所以策略完全一致：
+ * 先画已发生的进度，再追加错误信息。
+ *
+ * @param result 错误内容（来自 API 的 tool_result content，可能是字符串或块数组）
+ * @param opts.progressMessagesForMessage 这条工具调用累积到的进度消息
+ * @param opts.tools 工具注册表
+ * @param opts.verbose 是否全量展开
+ * @returns React 节点
+ */
 export function renderToolUseErrorMessage(result: ToolResultBlockParam['content'], {
   progressMessagesForMessage,
   tools,

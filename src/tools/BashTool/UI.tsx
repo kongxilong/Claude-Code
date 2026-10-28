@@ -1,3 +1,42 @@
+/**
+ * 【一句话定位】BashTool 的「展示层」：决定一条命令在终端里怎么显示（折叠标题、进度、结果、错误）。
+ *   不含任何权限与安全判断，只负责渲染。
+ *
+ * 【在架构中的位置】
+ *   上游：工具的渲染调度层（按 Tool 接口调用这里的 render* 函数）
+ *   下游：BashToolResultMessage.tsx（结果展示）、commentLabel.js（取首行 # 注释当标题）、
+ *        sedEditParser.js（把 sed 就地编辑识别成「改文件」来显示）、
+ *        components/shell/ShellProgressMessage、components/MessageResponse、ink 的 Box/Text
+ *   调用链：渲染层 -> renderToolUseMessage / renderToolUseProgressMessage / renderToolResultMessage /
+ *            renderToolUseQueuedMessage / renderToolUseErrorMessage -> React 组件树
+ *
+ * 【本文件包含什么】
+ *   - MAX_COMMAND_DISPLAY_LINES / MAX_COMMAND_DISPLAY_CHARS：命令显示的截断阈值
+ *   - BackgroundHint：显示「ctrl+b 放到后台」的提示组件，并处理该快捷键
+ *   - renderToolUseMessage()：命令「发起时」显示什么（是整条命令、还是文件路径、还是 # 注释）
+ *   - renderToolUseProgressMessage()：命令「执行中」显示什么（实时输出）
+ *   - renderToolUseQueuedMessage()：命令「排队中」显示 Waiting…
+ *   - renderToolResultMessage()：命令「完成后」显示什么
+ *   - renderToolUseErrorMessage()：命令「报错时」显示什么
+ *
+ * 【特别说明：本文件是 React Compiler 编译后的产物】
+ *   注意 `_c(9)`、`$` 数组、`Symbol.for('react.memo_cache_sentinel')` 这些奇怪写法——
+ *   它们是 React 编译器自动生成的「记忆化缓存」，等价于手写 useMemo。
+ *   读代码时把 `if ($[i] !== x) { ... $[i] = x }` 整体理解为「x 变了才重算，否则复用上次结果」，
+ *   t0/t1/t2… 是编译器起的临时变量名，本身没有业务含义
+ *
+ * 【TS/JSX 语法速查】（本文件实际出现的）
+ *   - `.tsx` 后缀 = 允许在 TS 里写 JSX；JSX `<Text dimColor>...` ≈ 在 Java 里内嵌 XML/HTML 模板
+ *   - JSX 里 `dimColor` 不写值等价于 `dimColor={true}`（布尔属性的简写）
+ *   - `<>...</>` 是 Fragment（片段）≈ 不产生实际节点的包装，用于返回多个并列元素
+ *   - `React.ReactNode` ≈ 「任何可渲染的东西」（节点 / 字符串 / null），类似 Java 的 Object 但用于渲染
+ *   - `.at(-1)` 取数组最后一个元素（负数索引从末尾算），比 arr[arr.length-1] 简洁
+ *   - `lastProgress?.data?.timeoutMs`：可选链，任一层为 null/undefined 就整体返回 undefined
+ *   - `Partial<T>`：把 T 的所有字段变成可选
+ *   - 参数解构 `function f({ verbose, theme: _theme }: {...})`：直接从对象入参里取字段；
+ *     `theme: _theme` 表示「取 theme 字段但改名成 _theme」，下划线前缀表示不使用
+ *   - 类型标注在变量名**后面**，Java 在前面
+ */
 import { c as _c } from "react/compiler-runtime";
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs';
 import * as React from 'react';
@@ -23,11 +62,39 @@ import { extractBashCommentLabel } from './commentLabel.js';
 import { parseSedEditCommand } from './sedEditParser.js';
 
 // Constants for command display
+// 显示阈值：命令太长会刷屏。这两个常量控制「发起时」命令最多显示几行、多少字符
+// 显示阈值：命令太长会刷屏。这两个常量控制「发起时」命令最多显示几行、多少字符
 const MAX_COMMAND_DISPLAY_LINES = 2;
 const MAX_COMMAND_DISPLAY_CHARS = 160;
 
 // Simple component to show background hint and handle ctrl+b
+// 中文补充：这个组件做两件事——① 显示快捷键提示；② 注册 ctrl+b 的处理逻辑。
+//   注意快捷键按下时是把**所有**正在前台跑的命令一起放到后台，而不只是当前这一条
 // When ctrl+b is pressed, backgrounds ALL running foreground commands
+/**
+ * 【做什么】渲染「ctrl+b 可放入后台」的提示，并绑定该快捷键
+ * 【为什么需要】命令跑太久时用户希望能把它挂到后台继续干别的，需要有可见的入口提示
+ * 【入参】t0：props，这里只用到 onBackground 回调（编译后 props 被合并成单个参数 t0）
+ * 【返回】React 节点；若环境变量禁用了后台任务功能，返回 null（不渲染任何东西）
+ * 【关键步骤】
+ *   ① 取 store 与 setAppState（全局状态）
+ *   ② 定义回调：backgroundAll 把所有前台命令转入后台，再调 onBackground
+ *   ③ 用 useKeybinding 绑定 task:background 快捷键
+ *   ④ tmux 下 ctrl+b 是 tmux 的前缀键，所以要提示连按两次（这是环境适配的坑）
+ *   ⑤ 功能被禁用时直接 return null（早于渲染，避免无谓渲染）
+ */
+/**
+ * 【做什么】渲染「ctrl+b 可放入后台」的提示，并绑定该快捷键
+ * 【为什么需要】命令跑太久时用户希望能把它挂到后台继续干别的，需要有可见的入口提示
+ * 【入参】t0：props，这里只用到 onBackground 回调（编译后 props 被合并成单个参数 t0）
+ * 【返回】React 节点；若环境变量禁用了后台任务功能，返回 null（不渲染任何东西）
+ * 【关键步骤】
+ *   ① 取 store 与 setAppState（全局状态）
+ *   ② 定义回调：backgroundAll 把所有前台命令转入后台，再调 onBackground
+ *   ③ 用 useKeybinding 绑定 task:background 快捷键
+ *   ④ tmux 下 ctrl+b 是 tmux 的前缀键，所以要提示连按两次（这是环境适配的坑）
+ *   ⑤ 功能被禁用时直接 return null（早于渲染，避免无谓渲染）
+ */
 export function BackgroundHint(t0) {
   const $ = _c(9);
   let t1;
@@ -46,6 +113,10 @@ export function BackgroundHint(t0) {
   let t2;
   if ($[2] !== onBackground || $[3] !== setAppState || $[4] !== store) {
     t2 = () => {
+      // backgroundAll 是「批量」而非单条：用户按一次键期望的是「把这些都挂后台」，
+      //   逐条处理反而要按很多次，体验更差
+      // backgroundAll 是「批量」而非单条：用户按一次键期望的是「把这些都挂后台」，
+      //   逐条处理反而要按很多次，体验更差
       backgroundAll(() => store.getState(), setAppState);
       onBackground?.();
     };
@@ -68,6 +139,8 @@ export function BackgroundHint(t0) {
   }
   useKeybinding("task:background", handleBackground, t3);
   const baseShortcut = useShortcutDisplay("task:background", "Task", "ctrl+b");
+  // tmux 会先吃掉第一次 ctrl+b（它自己的前缀键），所以提示用户连按两次才能真正触发
+  // tmux 会先吃掉第一次 ctrl+b（它自己的前缀键），所以提示用户连按两次才能真正触发
   const shortcut = env.terminal === "tmux" && baseShortcut === "ctrl+b" ? "ctrl+b ctrl+b (twice)" : baseShortcut;
   if (isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS)) {
     return null;
@@ -82,6 +155,28 @@ export function BackgroundHint(t0) {
   }
   return t4;
 }
+/**
+ * 【做什么】决定命令「发起时」在终端上显示成什么样
+ * 【为什么需要】把整条长命令原样刷给用户既占屏又难读；要按命令性质挑一个最有信息量的短表示
+ * 【入参】input：工具入参（主要用 command）；{ verbose, theme }：verbose=true 表示展开模式
+ * 【返回】React 节点；无命令时返回 null
+ * 【关键步骤】
+ *   ① sed 就地编辑（sed -i）特殊处理：它本质是「改文件」，所以直接显示文件路径（和 Edit 工具一致）
+ *   ② 非 verbose 时尝试显示首行 # 注释当标签（全屏模式下才启用，因为那是折叠视图）
+ *   ③ 仍然太长 → 先按行截断、再按字符截断，末尾加省略号 …
+ *   ④ 都不需要处理 → 原样显示整条命令
+ */
+/**
+ * 【做什么】决定命令「发起时」在终端上显示成什么样
+ * 【为什么需要】把整条长命令原样刷给用户既占屏又难读；要按命令性质挑一个最有信息量的短表示
+ * 【入参】input：工具入参（主要用 command）；{ verbose, theme }：verbose=true 表示展开模式
+ * 【返回】React 节点；无命令时返回 null
+ * 【关键步骤】
+ *   ① sed 就地编辑（sed -i）特殊处理：它本质是「改文件」，所以直接显示文件路径（和 Edit 工具一致）
+ *   ② 非 verbose 时尝试显示首行 # 注释当标签（全屏模式下才启用，因为那是折叠视图）
+ *   ③ 仍然太长 → 先按行截断、再按字符截断，末尾加省略号 …
+ *   ④ 都不需要处理 → 原样显示整条命令
+ */
 export function renderToolUseMessage(input: Partial<BashToolInput>, {
   verbose,
   theme: _theme
@@ -97,6 +192,10 @@ export function renderToolUseMessage(input: Partial<BashToolInput>, {
   }
 
   // Render sed in-place edits like file edits (show file path only)
+  // 为什么 sed 要特殊对待：`sed -i 's/a/b/' file` 用户关心的是「改了哪个文件」，
+  //   而不是那串 sed 脚本。复用文件编辑的展示方式，认知负担最小
+  // 为什么 sed 要特殊对待：`sed -i 's/a/b/' file` 用户关心的是「改了哪个文件」，
+  //   而不是那串 sed 脚本。复用文件编辑的展示方式，认知负担最小
   const sedInfo = parseSedEditCommand(command);
   if (sedInfo) {
     return verbose ? sedInfo.filePath : getDisplayPath(sedInfo.filePath);
@@ -104,6 +203,8 @@ export function renderToolUseMessage(input: Partial<BashToolInput>, {
   if (!verbose) {
     const lines = command.split('\n');
     if (isFullscreenEnvEnabled()) {
+      // 只在全屏（折叠）模式下用 # 注释当标题：折叠视图空间极小，注释比命令本身更有信息量
+      // 只在全屏（折叠）模式下用 # 注释当标题：折叠视图空间极小，注释比命令本身更有信息量
       const label = extractBashCommentLabel(command);
       if (label) {
         return label.length > MAX_COMMAND_DISPLAY_CHARS ? label.slice(0, MAX_COMMAND_DISPLAY_CHARS) + '…' : label;
@@ -128,6 +229,26 @@ export function renderToolUseMessage(input: Partial<BashToolInput>, {
   }
   return command;
 }
+/**
+ * 【做什么】渲染命令「执行中」的实时输出
+ * 【为什么需要】长命令需要让用户看到进度，否则像卡死
+ * 【入参】progressMessagesForMessage：进度消息流（取最后一条即可，因为它包含最新快照）
+ * 【返回】React 节点
+ * 【关键步骤】
+ *   ① `.at(-1)` 取最后一条进度（负数索引 = 从末尾数）
+ *   ② 还没有任何进度数据 → 显示 Running…（占位，避免空白闪烁）
+ *   ③ 有数据 → 交给 ShellProgressMessage 渲染完整输出、行数、字节数、耗时等
+ */
+/**
+ * 【做什么】渲染命令「执行中」的实时输出
+ * 【为什么需要】长命令需要让用户看到进度，否则像卡死
+ * 【入参】progressMessagesForMessage：进度消息流（取最后一条即可，因为它包含最新快照）
+ * 【返回】React 节点
+ * 【关键步骤】
+ *   ① `.at(-1)` 取最后一条进度（负数索引 = 从末尾数）
+ *   ② 还没有任何进度数据 → 显示 Running…（占位，避免空白闪烁）
+ *   ③ 有数据 → 交给 ShellProgressMessage 渲染完整输出、行数、字节数、耗时等
+ */
 export function renderToolUseProgressMessage(progressMessagesForMessage: ProgressMessage<BashProgress>[], {
   verbose,
   tools: _tools,
@@ -151,11 +272,29 @@ export function renderToolUseProgressMessage(progressMessagesForMessage: Progres
   const data = lastProgress.data;
   return <ShellProgressMessage fullOutput={data.fullOutput} output={data.output} elapsedTimeSeconds={data.elapsedTimeSeconds} totalLines={data.totalLines} totalBytes={data.totalBytes} timeoutMs={data.timeoutMs} taskId={data.taskId} verbose={verbose} />;
 }
+// 排队中（前面还有命令在跑）：显示 Waiting…，让用户知道这条已经在队列里了
+// 排队中（前面还有命令在跑）：显示 Waiting…，让用户知道这条已经在队列里了
 export function renderToolUseQueuedMessage(): React.ReactNode {
   return <MessageResponse height={1}>
       <Text dimColor>Waiting…</Text>
     </MessageResponse>;
 }
+/**
+ * 【做什么】渲染命令「完成后」的结果
+ * 【为什么需要】结果要区分图片 / 文本 / 无输出 / 后台任务等不同情形
+ * 【返回】React 节点（委托给 BashToolResultMessage 组件）
+ * 【关键步骤】
+ *   ① 从进度消息里取 timeoutMs（用于显示耗时提示）
+ *   ② 其余工作全部交给 BashToolResultMessage（本文件只做参数转接，保持渲染层薄）
+ */
+/**
+ * 【做什么】渲染命令「完成后」的结果
+ * 【为什么需要】结果要区分图片 / 文本 / 无输出 / 后台任务等不同情形
+ * 【返回】React 节点（委托给 BashToolResultMessage 组件）
+ * 【关键步骤】
+ *   ① 从进度消息里取 timeoutMs（用于显示耗时提示）
+ *   ② 其余工作全部交给 BashToolResultMessage（本文件只做参数转接，保持渲染层薄）
+ */
 export function renderToolResultMessage(content: Out, progressMessagesForMessage: ProgressMessage<BashProgress>[], {
   verbose,
   theme: _theme,
@@ -168,9 +307,15 @@ export function renderToolResultMessage(content: Out, progressMessagesForMessage
   style?: 'condensed';
 }): React.ReactNode {
   const lastProgress = progressMessagesForMessage.at(-1);
+  // 两层可选链：进度消息可能不存在，存在也可能没有 data；任一缺失就得到 undefined（不会抛异常）
+  // 两层可选链：进度消息可能不存在，存在也可能没有 data；任一缺失就得到 undefined（不会抛异常）
   const timeoutMs = lastProgress?.data?.timeoutMs;
   return <BashToolResultMessage content={content} verbose={verbose} timeoutMs={timeoutMs} />;
 }
+// 报错展示：统一交给 FallbackToolUseErrorMessage 处理（各工具共用一套错误渲染）
+// TS 速查：`ToolResultBlockParam['content']` 是索引访问类型 ≈ 取该类型的 content 字段的类型
+// 报错展示：统一交给 FallbackToolUseErrorMessage 处理（各工具共用一套错误渲染）
+// TS 速查：`ToolResultBlockParam['content']` 是索引访问类型 ≈ 取该类型的 content 字段的类型
 export function renderToolUseErrorMessage(result: ToolResultBlockParam['content'], {
   verbose,
   progressMessagesForMessage: _progressMessagesForMessage,

@@ -1,3 +1,33 @@
+/**
+ * ============================================================================
+ *  【文件总览】src/tools/FileReadTool/FileReadTool.ts
+ * ============================================================================
+ *
+ *  【一句话定位】
+ *  本文件实现 FileReadTool.ts 的相关逻辑（属于 Agent 工具/服务层的一部分）。
+ *
+ *  【在架构中的位置】
+ *  由主循环 src/query.ts 在需要对应能力时，通过工具调度（runTools → 工具 execute）调用本文件；本文件属于「工具层」，负责把某一类能力封装成一个可被模型点名的 Tool。
+ *
+ *  【本文件包含什么】
+ *  主要导出/定义：registerFileReadListener、MaxFileReadTokenExceededError、Input、Output、FileReadTool、CYBER_RISK_MITIGATION_REMINDER、readImageWithTokenBudget
+ *
+ *  【TS 语法速查】（针对本文件实际用到的，逐条 Java 对照）
+ *    · `?.` 可选链 ≈ Java 里 `obj != null ? obj.x : null`
+ *    · `??` 空值合并 ≈ `a != null ? a : b`（注意与 `||` 区别：`??` 只在 null/undefined 时兜底，0 和 '' 不会被动替换）
+ *    · `!` 非空断言（如 `x!`）≈ 强制类型转换，骗过编译器；运行时并不做检查，乱用会抛错
+ *    · `as X` ≈ Java 的 `(X)obj` 强制转换
+ *    · `type X = {...}` ≈ record，但 TS 是结构化（鸭子）类型：形状对得上就算同一类型，不要求显式 implements
+ *    · `A | B` 联合类型 ≈ 受限的 sealed interface / 代数数据类型
+ *    · `{...obj, k: v}` 展开 ≈ 生成新对象（不可变更新），原对象不变
+ *    · `x is T` 类型谓词 ≈ Java 的 `instanceof` 模式守卫，用于收窄类型
+ *    · `async function*` + `yield` + `for await` ≈ Java 的 Flux / 响应式流（一边产出一边消费）
+ *    · `feature('X')` 是编译期开关（类似 #ifdef），不是运行时 if
+ *    · `arr.at(-1)` 取最后一个元素（Java 没有，要 `arr.get(arr.size()-1)`）
+ *    · 类型标注写在变量名**后面**（`x: string`），Java 写在前面（`String x`）——这是最容易看串行的地方
+ *    · 箭头函数 `x => x.y` ≈ Java 的 lambda
+ */
+
 import type { Base64ImageSource } from '@anthropic-ai/sdk/resources/index.mjs'
 import { readdir, readFile as readFileAsync } from 'fs/promises'
 import * as path from 'path'
@@ -395,6 +425,12 @@ export const FileReadTool = buildTool({
   async preparePermissionMatcher({ file_path }) {
     return pattern => matchWildcardPattern(pattern, file_path)
   },
+  /**
+   * 权限检查：读取文件前先确认用户是否允许读这个路径。
+   * 为什么不在这里直接读文件？因为「权限」和「执行」职责分离——权限判定走统一的
+   * checkReadPermissionForTool（会查用户的 allow/deny 规则、是否首次询问等），
+   * 与 BashTool 的权限系统共用同一套机制。返回 PermissionDecision（允许/拒绝/需询问）。
+   */
   async checkPermissions(input, context): Promise<PermissionDecision> {
     const appState = context.getAppState()
     return checkReadPermissionForTool(
@@ -415,6 +451,14 @@ export const FileReadTool = buildTool({
     return ''
   },
   renderToolUseErrorMessage,
+  /**
+   * 输入校验（纯字符串/路径判断，不做 I/O）：在真正读文件前先挡掉不合法的输入。
+   * 关键步骤：
+   *   ① pages 参数（仅 PDF 用）必须是 "1-5" / "3" / "10-20" 这种 1-based 页码范围，解析失败直接报错
+   *   ② 二进制扩展名检查：.exe/.zip 这类二进制文件本工具读不了（但 PDF/图片/SVG 例外，本工具能原生渲染）
+   *   ③ 设备文件黑名单：/dev/zero、/dev/stdin 等读起来会卡死或无限输出，按路径直接拒绝
+   * 注意：这里只校验「输入是否合法」，不校验「文件是否存在」——存在性由 callInner 里的 ENOENT 处理。
+   */
   async validateInput({ file_path, pages }, toolUseContext: ToolUseContext) {
     // Validate pages parameter (pure string parsing, no I/O)
     if (pages !== undefined) {
@@ -493,6 +537,16 @@ export const FileReadTool = buildTool({
 
     return { result: true }
   },
+  /**
+   * FileReadTool 的入口（模型点名 "Read" 后由工具调度调用到这里）。
+   * 关键步骤：
+   *   ① 解析读文件的上下限（offset/limit，用于只读大文件的一段），并取出 maxSizeBytes/maxTokens 上限
+   *   ② 去重（dedup）：如果同一文件路径+同一区间之前已经读过、且磁盘 mtime 没变，
+   *      直接返回一个 "file_unchanged" 占位，不再把整份内容重发一遍——
+   *      否则每轮对话都会重复塞一份全文，白白烧掉 prompt 缓存的 cache_creation token（实测约占 2.6%）
+   *   ③ 顺带从文件路径发现/激活「技能（skill）」，后台非阻塞进行
+   *   ④ 真正读文件的活交给 callInner（拆出来是为了在外层统一捕获 ENOENT「文件不存在」错误）
+   */
   async call(
     { file_path, offset = 1, limit = undefined, pages },
     context,
@@ -799,6 +853,15 @@ function createImageResponse(
 }
 
 /**
+ * call 的真正实现，按「文件类型」分路处理（这是理解本文件的关键）：
+ *   · ipynb（Jupyter 笔记本）→ 读单元格，超 maxSizeBytes 报错，并提示用 jq 分段读
+ *   · 图片（png/jpg/...）    → 压缩到 token 预算内，转成 base64 直接喂给模型看
+ *   · PDF                    → 按 pages 参数抽页（内联 or 抽成图片目录）
+ *   · 纯文本                 → 按 offset/limit 切片、加行号、超 token 预算则截断并提示用 offset/limit
+ * 拆成独立函数，是为了让外层 call 能统一 try/catch 处理「文件不存在（ENOENT）」这类错误，
+ * 不至于让分支逻辑里到处重复错误处理。
+ */
+/**
  * Inner implementation of call, separated to allow ENOENT handling in the outer call.
  */
 async function callInner(
@@ -1093,6 +1156,15 @@ async function callInner(
  * @param filePath - Path to the image file
  * @param maxTokens - Maximum token budget for the image
  * @returns Image data with appropriate compression applied
+ */
+/**
+ * 把一张图片读进来，并「压」到模型能消费的 token 预算内。
+ * 为什么要压：图片按分辨率算 token，一张大图可能烧掉几十万 token。
+ * 关键步骤：
+ *   ① 只读一次文件，且用 maxBytes 上限挡住超大文件（避免 OOM 内存爆掉）
+ *   ② 先按头信息探测真实格式（detectImageFormatFromBuffer），不轻信扩展名
+ *   ③ 尝试标准缩放；失败再退而求其次做「降采样」（抽掉部分像素），直到满足 maxTokens
+ *   ④ 返回 base64 + 媒体类型 + 原始大小，供模型直接"看"
  */
 export async function readImageWithTokenBudget(
   filePath: string,

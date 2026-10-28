@@ -1,4 +1,32 @@
 /**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 中文导读（英文原注释很长，这里给一份自成一体的中文说明，原注释完整保留）：
+ *
+ * 【一句话定位】让「权限确认弹框」能通过 channel（Telegram / iMessage / Discord）远程审批。
+ *
+ * 【整体流程】
+ * ① Claude Code 遇到权限弹框时，除了本地 UI，还会把提示通过已启用的 channel 发出去；
+ * ② 提示里带一个 5 位小写的短 ID（如 tbxkq），用户在手机上回复 “yes tbxkq”；
+ * ③ channel server 负责解析这条回复，然后向 CC 发一个「结构化事件」
+ *    notifications/claude/channel/permission，内容是 { request_id, behavior }；
+ * ④ CC 只按 request_id 在挂起的 Map 里找对应的 resolver，第一个到的（本地UI/bridge/hook/channel）获胜。
+ *
+ * 【安全边界在哪里】
+ * 审批人是「通过 channel 的人类」，不是 Claude 自己。真正的信任边界不是终端，而是白名单
+ * （tengu_harbor_ledger，见 channelAllowlist.ts）：一个被攻陷的 channel server 理论上可以伪造
+ * 「yes xxx」而用户根本没看到提示——这是已知并接受的风险，因为被攻陷的 channel 本来就能无限次
+ * 注入对话内容（慢慢社工、等 acceptEdits 等），「注入+自批」只是更快，并没有更强。
+ * 弹框能拖慢一个被攻陷的 channel，但拦不住它。
+ *
+ * 【本文件包含什么】
+ * - isChannelPermissionRelayEnabled()：GrowthBook 上的独立开关。
+ * - PERMISSION_REPLY_RE：回复格式规范（导出给插件直接用，避免各写一份正则）。
+ * - shortRequestId(toolUseID)：把长 toolUseID 哈希成 5 位小写字母短 ID，并避开脏词。
+ * - truncateForPreview(input)：把 tool 入参截成 200 字符的手机友好预览。
+ * - filterPermissionRelayClients()：筛出「能转发权限请求」的 channel 客户端（三个条件全满足）。
+ * - createChannelPermissionCallbacks()：维护 requestId → resolver 的挂起表。
+ * ─────────────────────────────────────────────────────────────────────────────
+/**
  * Permission prompts over channels (Telegram, iMessage, Discord).
  *
  * Mirrors `BridgePermissionCallbacks` — when CC hits a permission dialog,
@@ -33,16 +61,25 @@ import { getFeatureValue_CACHED_MAY_BE_STALE } from '../analytics/growthbook.js'
  * Checked once at useManageMCPConnections mount — mid-session flag changes
  * don't apply until restart.
  */
+  /**
+   * 中文：是否允许通过 channel 转发权限请求（GrowthBook 上的 tengu_harbor_permissions）。
+   * 为什么要跟 channel 总开关（tengu_harbor）分开：这样 channel 功能可以先发布，
+   * 而「远程审批权限」这个更敏感的能力可以之后再单独灰度，不必等烘焙期。
+   * 注意：这个值只在 useManageMCPConnections 挂载时读一次，会话中途改 flag 要重启才生效。
+   */
 export function isChannelPermissionRelayEnabled(): boolean {
   return getFeatureValue_CACHED_MAY_BE_STALE('tengu_harbor_permissions', false)
 }
 
+  // 中文：一次审批的结果——behavior 是放行/拒绝，fromServer 记录是哪个 channel 回的（便于日志溯源）
 export type ChannelPermissionResponse = {
   behavior: 'allow' | 'deny'
   /** Which channel server the reply came from (e.g., "plugin:telegram:tg"). */
   fromServer: string
 }
 
+  // 中文：回调接口。onResponse 注册「这个 requestId 的处理器」并返回取消注册函数；
+  //       resolve 由专门的 notification 处理器调用（CC 自己不再对文本做正则匹配）
 export type ChannelPermissionCallbacks = {
   /** Register a resolver for a request ID. Returns unsubscribe. */
   onResponse(
@@ -72,9 +109,16 @@ export type ChannelPermissionCallbacks = {
  * behavior} — CC doesn't regex-match text anymore. Exported so plugins can
  * import the exact regex rather than hand-copying it.
  */
+  /**
+   * 中文：回复格式规范，导出给 channel 插件直接复用（避免各家手写正则导致行为不一致）。
+   * 形态：可选的空白 + (y|yes|n|no) + 空白 + 5 位小写字母 + 可选空白，忽略大小写。
+   * 设计取舍：5 位字母且不含 'l'（像 1 和 I）；大小写不敏感（手机自动纠错会把首字母大写）；
+   * 不允许裸 yes/no（防止把日常聊天误判成审批）；不允许前缀后缀闲聊。
+   */
 export const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 // 25-letter alphabet: a-z minus 'l' (looks like 1/I). 25^5 ≈ 9.8M space.
+  // 中文：字母表去掉了 'l'——在很多字体里 l 和 1、I 长得一样，用户照着抄容易抄错
 const ID_ALPHABET = 'abcdefghijkmnopqrstuvwxyz'
 
 // Substring blocklist — 5 random letters can spell things (Kenneth, in the
@@ -109,6 +153,12 @@ const ID_AVOID_SUBSTRINGS = [
   'anus',
 ]
 
+  /**
+   * 中文：把任意字符串哈希成 5 位字母短 ID（内部函数）。
+   * 算法：FNV-1a 哈希成 uint32，再按 25 进制编码取 5 位。
+   * 为什么不是加密级随机（英文注释说明了）：这只是一个「稳定、短、纯字母」的 ID，
+   * 不需要抗碰撞攻击；32 位哈希约有 6.9 个字母的熵，取 5 位绰绰有余。
+   */
 function hashToId(input: string): string {
   // FNV-1a → uint32, then base-25 encode. Not crypto, just a stable
   // short letters-only ID. 32 bits / log2(25) ≈ 6.9 letters of entropy;
@@ -118,6 +168,7 @@ function hashToId(input: string): string {
     h ^= input.charCodeAt(i)
     h = Math.imul(h, 0x01000193)
   }
+    // 中文：务必用 Math.imul 做乘法（32 位整数乘法），直接用 * 会因为超出 2^31 而丢失精度
   h = h >>> 0
   let s = ''
   for (let i = 0; i < 5; i++) {
@@ -137,12 +188,20 @@ function hashToId(input: string): string {
  * letters can spell things you don't want in a text message to your phone.
  * toolUseIDs are `toolu_` + base64-ish; we hash rather than slice.
  */
+  /**
+   * 中文：由 toolUseID 生成用户在手机上输入用的短 ID。
+   * 为什么纯字母（英文注释有说明）：手机用户不用切换键盘模式；若用十六进制会在 a-f 和 0-9 之间来回切。
+   * 为什么是 5 位：25^5 ≈ 980 万种组合，单个会话要同时挂起约 3000 个弹框才有 50% 撞号概率，不可能发生。
+   * 脏词处理：随机 5 个字母可能拼出不雅单词，命中就加盐重哈希（最多 10 次）。
+   * 入参 toolUseID：形如 'toolu_xxx' 的 ID；这里哈希而不是截取，因为截取会丢失区分度。
+   */
 export function shortRequestId(toolUseID: string): string {
   // 7 length-3 × 3 positions × 25² + 15 length-4 × 2 × 25 + 2 length-5
   // ≈ 13,877 blocked IDs out of 9.8M — roughly 1 in 700 hits the blocklist.
   // Cap at 10 retries; (1/700)^10 is negligible.
   let candidate = hashToId(toolUseID)
   for (let salt = 0; salt < 10; salt++) {
+    // 中文：命中脏词就换盐重哈希；命中概率约 1/700，重试 10 次后仍命中也算可接受（概率可忽略）
     if (!ID_AVOID_SUBSTRINGS.some(bad => candidate.includes(bad))) {
       return candidate
     }
@@ -157,6 +216,12 @@ export function shortRequestId(toolUseID: string): string {
  * terminal dialog; the channel gets a summary so Write(5KB-file) doesn't
  * flood your texts. Server decides whether/how to show it.
  */
+  /**
+   * 中文：把 tool 的入参截成适合手机屏幕的短预览（200 字符，约 3 行）。
+   * 为什么要截断：完整入参在本地终端弹框里已经能看到；全部发到手机会把短信刷爆
+   * （例如 Write 一个 5KB 文件）。是否展示、怎么展示由 channel server 自己决定。
+   * 序列化失败时返回 '(unserializable)'（例如入参里有循环引用）。
+   */
 export function truncateForPreview(input: unknown): string {
   try {
     const s = jsonStringify(input)
@@ -174,6 +239,15 @@ export function truncateForPreview(input: unknown): string {
  * permission surface by accident (Kenneth's "users may be unpleasantly
  * surprised"). Centralized here so a future fourth condition lands once.
  */
+  /**
+   * 中文：筛出「可以转发权限请求」的 channel 客户端。三个条件必须全满足：
+   *   ① 连接状态是 connected；② 在本会话的 --channels 白名单里；③ 同时声明了两个 capability
+   *      （'claude/channel' 和 'claude/channel/permission'）。
+   * 第二个 capability 就是 server 的显式「我愿意接收权限请求」声明——只做消息转发的 channel
+   * 不会因为升级就莫名其妙变成审批入口。
+   * 泛型 `<T extends {...}>`：≈ Java 的 `<T extends SomeInterface>`，约束入参必须有哪些字段。
+   * 入参 isInAllowlist：由调用方传入的白名单判断函数（把「会话状态」从本纯函数里解耦出去）。
+   */
 export function filterPermissionRelayClients<
   T extends {
     type: string
@@ -186,6 +260,8 @@ export function filterPermissionRelayClients<
 ): (T & { type: 'connected' })[] {
   return clients.filter(
     (c): c is T & { type: 'connected' } =>
+    // 中文：`c is T & {type:'connected'}` 是「类型谓词」，告诉编译器 filter 之后元素类型收窄了，
+    //       ≈ Java 里 instanceof 模式匹配；`T & {...}` 是交叉类型（两个类型都要满足）
       c.type === 'connected' &&
       isInAllowlist(c.name) &&
       c.capabilities?.experimental?.['claude/channel'] !== undefined &&
@@ -206,6 +282,11 @@ export function filterPermissionRelayClients<
  * match against the pending map. No regex on CC's side — text in the
  * general channel can't accidentally approve anything.
  */
+  /**
+   * 中文：造出回调对象。pending 这个 Map 被闭包捕获（英文注释强调：不放模块级、也不放 AppState，
+   * 因为函数放进 state 会引发相等性/序列化问题），生命周期与 React hook 一致。
+   * 返回 { onResponse, resolve }：前者注册等待者并返回「取消注册」函数；后者由 notification 处理器调用。
+   */
 export function createChannelPermissionCallbacks(): ChannelPermissionCallbacks {
   const pending = new Map<
     string,
@@ -213,6 +294,7 @@ export function createChannelPermissionCallbacks(): ChannelPermissionCallbacks {
   >()
 
   return {
+    // 中文：对象字面量里直接写方法名（对象方法简写），等价于 onResponse: function(requestId, handler) {...}
     onResponse(requestId, handler) {
       // Lowercase here too — resolve() already does; asymmetry means a
       // future caller passing a mixed-case ID would silently never match.
@@ -232,6 +314,8 @@ export function createChannelPermissionCallbacks(): ChannelPermissionCallbacks {
       // Delete BEFORE calling — if resolver throws or re-enters, the
       // entry is already gone. Also handles duplicate events (second
       // emission falls through — server bug or network dup, ignore).
+      // 中文：先删再调——万一 resolver 抛异常或重入，这条记录也已经清掉了；
+      //        重复事件（server bug 或网络重发）第二次进来会因为查不到而直接返回 false
       pending.delete(key)
       resolver({ behavior, fromServer })
       return true

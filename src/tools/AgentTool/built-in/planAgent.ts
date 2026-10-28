@@ -1,3 +1,26 @@
+/**
+ * 【一句话定位】内置 agent「Plan」的定义：只读的**架构规划**专家，产出实现方案而不是代码。
+ *
+ * 【在架构中的位置】
+ *   上游：builtInAgents.ts（和 Explore 共用同一个开关）。
+ *   下游：loadAgentsDir.ts 的 BuiltInAgentDefinition 类型；工具集直接复用 EXPLORE_AGENT 的。
+ *   和 Explore 的区别：Explore 回答「代码里现在是什么」，Plan 回答「应该怎么改」。
+ *   两者都是只读，所以 disallowedTools 完全一致。
+ *
+ * 【本文件包含什么】
+ *   - getPlanV2SystemPrompt()：规划流程（理解需求 → 探索 → 设计 → 细化）+ 输出格式要求。
+ *   - PLAN_AGENT：agent 定义对象。
+ *
+ * 【TS 语法速查】
+ *   - `tools: EXPLORE_AGENT.tools`：直接复用另一个 agent 定义的 tools 字段
+ *     （这里 EXPLORE_AGENT.tools 是 undefined，等于「不限制」，配合 disallowedTools 使用）。
+ *   - 模板字符串里嵌套三元：`${hasEmbeddedSearchTools() ? ', grep' : ''}` ——
+ *     条件成立时插入一段文本，否则插入空串（本文件多处这样用）。
+ *   - `model: 'inherit'` 跟随主模型：规划任务需要强推理能力，不能用小模型。
+ *   - `omitClaudeMd: true`：和 Explore 同理，但它仍可以自己 Read CLAUDE.md 查规范
+ *     （只是不塞进上下文），所以不会真的拿不到约定。
+ *   - 类型标注、可选属性、箭头函数等基础语法见其它文件头部说明。
+ */
 import { BASH_TOOL_NAME } from 'src/tools/BashTool/toolName.js'
 import { EXIT_PLAN_MODE_TOOL_NAME } from 'src/tools/ExitPlanModeTool/constants.js'
 import { FILE_EDIT_TOOL_NAME } from 'src/tools/FileEditTool/constants.js'
@@ -11,9 +34,15 @@ import { AGENT_TOOL_NAME } from '../constants.js'
 import type { BuiltInAgentDefinition } from '../loadAgentsDir.js'
 import { EXPLORE_AGENT } from './exploreAgent.js'
 
+/**
+ * 生成 Plan agent 的 system prompt。
+ * 结构设计成四步流程（理解 → 探索 → 设计 → 细化），最后强制要求输出
+ * 「### Critical Files for Implementation」清单 —— 调用方要靠它知道该改哪些文件。
+ */
 function getPlanV2SystemPrompt(): string {
   // Ant-native builds alias find/grep to embedded bfs/ugrep and remove the
   // dedicated Glob/Grep tools, so point at find/grep instead.
+// 内嵌搜索工具版本下用 find/grep，否则用 Glob/Grep 工具
   const searchToolsHint = hasEmbeddedSearchTools()
     ? `\`find\`, \`grep\`, and ${FILE_READ_TOOL_NAME}`
     : `${GLOB_TOOL_NAME}, ${GREP_TOOL_NAME}, and ${FILE_READ_TOOL_NAME}`
@@ -70,10 +99,12 @@ List 3-5 files most critical for implementing this plan:
 REMEMBER: You can ONLY explore and plan. You CANNOT and MUST NOT write, edit, or modify any files. You do NOT have access to file editing tools.`
 }
 
+// agent 定义。工具集合直接复用 EXPLORE_AGENT 的（两者都是只读，限制相同）
 export const PLAN_AGENT: BuiltInAgentDefinition = {
   agentType: 'Plan',
   whenToUse:
     'Software architect agent for designing implementation plans. Use this when you need to plan the implementation strategy for a task. Returns step-by-step plans, identifies critical files, and considers architectural trade-offs.',
+// 和 Explore 完全相同的禁用清单：不能派生、不能交计划、不能改文件/notebook
   disallowedTools: [
     AGENT_TOOL_NAME,
     EXIT_PLAN_MODE_TOOL_NAME,
@@ -84,9 +115,11 @@ export const PLAN_AGENT: BuiltInAgentDefinition = {
   source: 'built-in',
   tools: EXPLORE_AGENT.tools,
   baseDir: 'built-in',
+// 跟随主模型：规划需要强推理
   model: 'inherit',
   // Plan is read-only and can Read CLAUDE.md directly if it needs conventions.
   // Dropping it from context saves tokens without blocking access.
+// 和 Explore 一样丢掉 CLAUDE.md 省 token；它真需要规范时可以自己 Read
   omitClaudeMd: true,
   getSystemPrompt: () => getPlanV2SystemPrompt(),
 }

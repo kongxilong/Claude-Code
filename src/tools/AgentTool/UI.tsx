@@ -1,3 +1,55 @@
+/**
+ * 【一句话定位】Agent 工具在终端里的**渲染层**：把子 Agent 的实时进度、最终回复、分组摘要
+ * 画成 Ink（React 的终端版）组件树。本文件不做任何业务决策，只负责「怎么显示」。
+ *
+ * 【在架构中的位置】
+ *   上游：AgentTool.tsx 把这里的 render* 函数注册成工具的渲染回调；
+ *   工具框架在合适的时机（工具调用中 / 完成 / 出错 / 被拒）调用它们。
+ *   下游：components/Message.js、components/AgentProgressLine.js、components/CtrlOToExpand.js。
+ *   注意：本文件是编译产物风格的代码（带 React Compiler 生成的 `_c` / `$[...]` 缓存），
+ *   读起来会比较陌生，下面【TS 语法速查】里专门解释。
+ *
+ * 【本文件包含什么】
+ *   - hasProgressMessage()：类型守卫，判断进度数据里有没有 message 字段。
+ *   - getSearchOrReadInfo()：判断一条进度消息是不是「搜索/读取/REPL」类操作（可折叠显示）。
+ *   - processProgressMessages()：把连续的同质操作折叠成一行摘要（只搜了 5 个文件、读了 3 个）。
+ *   - AgentPromptDisplay / AgentResponseDisplay：展示子 Agent 的入参 prompt 与最终回复。
+ *   - VerboseAgentTranscript：ctrl+o 展开后的完整子 Agent 对话。
+ *   - renderToolResultMessage()：完成后显示「Done (N tool uses · X tokens · Ys)」。
+ *   - renderToolUseMessage() / renderToolUseTag()：调用中与标签（如模型名）。
+ *   - renderToolUseProgressMessage()：跑的过程中实时显示的进度（含折叠与极简模式）。
+ *   - renderToolUseRejectedMessage() / renderToolUseErrorMessage()：被拒 / 出错时的显示。
+ *   - renderGroupedAgentToolUse()：一次起了多个子 Agent 时的分组显示。
+ *   - userFacingName() / userFacingNameBackgroundColor()：给主 Agent 显示的名字和颜色。
+ *   - extractLastToolInfo()：从进度消息里推断「最后一次在用什么工具」的可读描述。
+ *
+ * 【TS 语法速查】(针对本文件实际出现的语法)
+ *   - .tsx 文件 + JSX：代码里直接写 `<Box flexDirection="column">...</Box>` 这类标签。
+ *     它不是字符串模板，而是会被编译成 React 元素树（≈ Java 的 StringTemplate 产出字符串，
+ *     JSX 产出的是组件对象树）。`<Foo />` 是自闭合写法，等于 `<Foo></Foo>`。
+ *     大写开头 = 组件/变量引用；小写开头（如 `<div>`）= 原生标签。
+ *   - JSX 里嵌表达式要用 `{}`：`<Text>{count}</Text>`；`{' '}` 是显式插一个空格。
+ *   - `<>{...}</>` 是 Fragment（片段）：包一层但不产生真实节点，≈ Java 里返回 List<Node>。
+ *   - 条件渲染惯用法：`{cond && <X/>}`（cond 为 false 时渲染 false = 什么都不渲染）。
+ *     三元：`{a ? <X/> : <Y/>}`。
+ *   - React Compiler 产物：`const $ = _c(N)` 申请 N 个缓存槽；
+ *     `$[0] === Symbol.for('react.memo_cache_sentinel')` 判断这个槽是不是空的；
+ *     `if ($[1] !== prompt) { ... $[1] = prompt; $[2] = t3 }` 就是「依赖没变就复用上次的结果」
+ *     ≈ 手写 memoization，等价于 React 的 useMemo，只是被编译器展开成了显式的 if。
+ *     读代码时可以直接**忽略** `$[...]` 相关行，只看 `t2`/`t3` 这些真正的计算。
+ *   - 参数名 `t0`/`t1` 也是编译器产物：原本是解构 `const { prompt, content } = props`，
+ *     被压平成 `t0` 再逐层取字段。
+ *   - `React.ReactNode`：可以是元素、字符串、数字、null 或它们的数组 —— 渲染函数的返回值类型。
+ *   - `Partial<X>` 工具类型：把 X 的所有属性变成可选 ≈ 「这个对象可能只有部分字段」。
+ *   - `data is AgentToolProgress` 类型谓词 ≈ instanceof 模式匹配。
+ *   - `keyof Theme`：取 Theme 所有键组成的联合类型 ≈ 枚举出所有颜色名。
+ *   - `as keyof Theme` / `as X`：强制转换（编译期，不做运行时检查）。
+ *   - `??` 空值合并（0 和 '' 不被替换）；`?.` 可选链；`!` 后缀非空断言。
+ *   - `arr.findLast(fn)` 从后往前找；`arr.slice(-3)` 取最后三个；`arr.slice(0, n)` 取前 n 个。
+ *   - `Array.isArray(x)` 判断数组（TS 里联合类型要先这么判才能当数组用）。
+ *   - `new Map<string, V>()` / `map.get(k)` / `map.set(k, v)` 与 Java 一致。
+ *   - `readonly` 修饰符 ≈ final（只读，编译期检查）。
+ */
 import { c as _c } from "react/compiler-runtime";
 import type { ToolResultBlockParam, ToolUseBlockParam } from '@anthropic-ai/sdk/resources/index.mjs';
 import * as React from 'react';
@@ -30,6 +82,7 @@ import type { outputSchema, Progress, RemoteLaunchedOutput } from './AgentTool.j
 import { inputSchema } from './AgentTool.js';
 import { getAgentColor } from './agentColorManager.js';
 import { GENERAL_PURPOSE_AGENT } from './built-in/generalPurposeAgent.js';
+// 进度区最多显示 3 条，超出折叠成「+N more tool uses」——终端高度有限，不能全打出来
 const MAX_PROGRESS_MESSAGES_TO_SHOW = 3;
 
 /**
@@ -46,11 +99,22 @@ function hasProgressMessage(data: Progress): data is AgentToolProgress {
 }
 
 /**
+ * 类型守卫：判断一条 Progress 数据里有没有 `message` 字段。
+ * 为什么要判断：Progress 是联合类型，除了 agent_progress 还有从子 Agent 转发上来的
+ * bash_progress / powershell_progress，后者没有 message 字段，UI 辅助函数必须跳过它们。
+ */
+/**
  * Check if a progress message is a search/read/REPL operation (tool use or result).
  * Returns { isSearch, isRead, isREPL } if it's a collapsible operation, null otherwise.
  *
  * For tool_result messages, uses the provided `toolUseByID` map to find the
  * corresponding tool_use block instead of relying on `normalizedMessages`.
+ */
+/**
+ * 判断一条进度消息是不是「搜索 / 读取 / REPL」这类可折叠的同质操作。
+ * tool_result 类型的消息要靠 toolUseByID 这张表反查它对应的 tool_use 块
+ * （因为 tool_result 自己不带工具名）。
+ * @returns { isSearch, isRead, isREPL } 或 null（不是这三类）
  */
 function getSearchOrReadInfo(progressMessage: ProgressMessage<Progress>, tools: Tools, toolUseByID: Map<string, ToolUseBlockParam>): {
   isSearch: boolean;
@@ -79,6 +143,7 @@ function getSearchOrReadInfo(progressMessage: ProgressMessage<Progress>, tools: 
   }
   return null;
 }
+// 折叠后的一行摘要消息类型（替代若干条原始消息）
 type SummaryMessage = {
   type: 'summary';
   searchCount: number;
@@ -87,11 +152,24 @@ type SummaryMessage = {
   uuid: string;
   isActive: boolean; // true if still in progress (last message was tool_use, not tool_result)
 };
+// ProcessedMessage 是联合类型：要么原样保留一条消息，要么替换成一条摘要
 type ProcessedMessage = {
   type: 'original';
   message: ProgressMessage<AgentToolProgress>;
 } | SummaryMessage;
 
+/**
+ * 把连续的搜索/读取/REPL 操作折叠成一行摘要，避免终端被几十行 Read 刷屏。
+ * 只在 ant 内部构建里做折叠（外部构建原样返回）。
+ *
+ * 关键步骤：
+ *   ① 边遍历边建 tool_use_id → tool_use 块的索引表
+ *   ② 命中搜索/读/REPL 就累加进 currentGroup（只数 tool_result 不数 tool_use，避免重复计数）
+ *   ③ 遇到其它消息就 flushGroup 结束当前分组，再原样加入这条消息
+ *   ④ 最后 flushGroup(isAgentRunning)：最后一组是「进行中」还是「已完成」取决于 agent 还在不在跑
+ *
+ * @param isAgentRunning true 表示 agent 还没结束，最后一组标记为 active
+ */
 /**
  * Process progress messages to group consecutive search/read operations into summaries.
  * For ants only - returns original messages for non-ants.
@@ -99,6 +177,7 @@ type ProcessedMessage = {
  */
 function processProgressMessages(messages: ProgressMessage<Progress>[], tools: Tools, isAgentRunning: boolean): ProcessedMessage[] {
   // Only process for ants
+// 外部构建不做折叠，原样返回（过滤掉没有 message 的和 user 类型的）
   if ("external" !== 'ant') {
     return messages.filter((m): m is ProgressMessage<AgentToolProgress> => hasProgressMessage(m.data) && m.data.message.type !== 'user').map(m => ({
       type: 'original',
@@ -112,6 +191,8 @@ function processProgressMessages(messages: ProgressMessage<Progress>[], tools: T
     replCount: number;
     startUuid: string;
   } | null = null;
+// 函数声明提升（hoisting）：flushGroup 定义在下面用到它的循环之前也能用，
+// 这是 JS function 声明的特性（Java 里方法定义顺序无关，效果类似）
   function flushGroup(isActive: boolean): void {
     if (currentGroup && (currentGroup.searchCount > 0 || currentGroup.readCount > 0 || currentGroup.replCount > 0)) {
       result.push({
@@ -149,6 +230,8 @@ function processProgressMessages(messages: ProgressMessage<Progress>[], tools: T
           startUuid: msg.uuid
         };
       }
+// 只统计 tool_result（不统计 tool_use）：一次工具调用会产生两条进度消息，
+// 都数的话数字会翻倍，和最终「Done (N tool uses)」对不上
       // Only count tool_result messages (not tool_use) to avoid double counting
       if (msg.data.message.type === 'user') {
         if (info.isSearch) {
@@ -165,6 +248,8 @@ function processProgressMessages(messages: ProgressMessage<Progress>[], tools: T
       // Skip user tool_result messages — subagent progress messages lack
       // toolUseResult, so UserToolSuccessMessage returns null and the
       // height=1 Box in renderToolUseProgressMessage shows as a blank line.
+// 跳过 user 类型的 tool_result 消息：子 Agent 的进度消息里没有 toolUseResult，
+// UserToolSuccessMessage 会返回 null，height=1 的 Box 就渲染成一行空白
       if (msg.data.message.type !== 'user') {
         result.push({
           type: 'original',
@@ -178,9 +263,17 @@ function processProgressMessages(messages: ProgressMessage<Progress>[], tools: T
   flushGroup(isAgentRunning);
   return result;
 }
+// 估算：每个进行中的工具调用大约占 9 行，再给终端留 7 行缓冲
 const ESTIMATED_LINES_PER_TOOL = 9;
 const TERMINAL_BUFFER_LINES = 7;
+// `z.input<ReturnType<typeof outputSchema>>`：从 zod schema 反推出输入类型。
+// ReturnType<typeof f> = 取 f 的返回类型；z.input<> = 取 schema 的输入类型（区别于 z.output）
 type Output = z.input<ReturnType<typeof outputSchema>>;
+/**
+ * 渲染子 Agent 的 prompt（ctrl+o 展开时显示）。
+ * 下面是 React Compiler 编译后的形态：`$` 是缓存槽数组，`t1/t2/t3` 是中间值。
+ * 读的时候忽略所有 `$[...]` 行即可。
+ */
 export function AgentPromptDisplay(t0) {
   const $ = _c(3);
   const {
@@ -205,6 +298,9 @@ export function AgentPromptDisplay(t0) {
   }
   return t3;
 }
+/**
+ * 渲染子 Agent 的最终回复（content 是一组 text block）。
+ */
 export function AgentResponseDisplay(t0) {
   const $ = _c(5);
   const {
@@ -238,6 +334,7 @@ export function AgentResponseDisplay(t0) {
 function _temp(block, index) {
   return <Box key={index} paddingLeft={2} marginTop={index === 0 ? 0 : 1}><Markdown>{block.text}</Markdown></Box>;
 }
+// ctrl+o 展开的完整 transcript 组件的入参类型
 type VerboseAgentTranscriptProps = {
   progressMessages: ProgressMessage<Progress>[];
   tools: Tools;
@@ -312,6 +409,15 @@ function _temp3(pm_0) {
 function _temp2(pm) {
   return hasProgressMessage(pm.data);
 }
+/**
+ * 渲染子 Agent 的**结果**（对应 status='completed'）。
+ * 三种情形：
+ *   - remote_launched：显示 taskId 和远端 session 地址
+ *   - async_launched：显示「已转入后台」+ 快捷键提示
+ *   - completed：显示 Done (N tool uses · X tokens · Ys)，展开时还显示完整对话和最终回复
+ * @param progressMessagesForMessage 这个工具调用累积的所有进度消息（展开 transcript 要用）
+ * @param isTranscriptMode 是否处于 ctrl+o 展开状态（决定显示的详略）
+ */
 export function renderToolResultMessage(data: Output, progressMessagesForMessage: ProgressMessage<Progress>[], {
   tools,
   verbose,
@@ -325,6 +431,7 @@ export function renderToolResultMessage(data: Output, progressMessagesForMessage
 }): React.ReactNode {
   // Remote-launched agents (ant-only) use a private output type not in the
   // public schema. Narrow via the internal discriminant.
+// remote_launched 是私有输出类型（不在公开 schema 里），用内部判别字段收窄
   const internal = data as Output | RemoteLaunchedOutput;
   if (internal.status === 'remote_launched') {
     return <Box flexDirection="column">
@@ -373,6 +480,7 @@ export function renderToolResultMessage(data: Output, progressMessagesForMessage
     content,
     prompt
   } = data;
+// 拼出「Done (3 tool uses · 12.5k tokens · 8s)」这行总结
   const result = [totalToolUseCount === 1 ? '1 tool use' : `${totalToolUseCount} tool uses`, formatNumber(totalTokens) + ' tokens', formatDuration(totalDurationMs)];
   const completionMessage = `Done (${result.join(' · ')})`;
   const finalAssistantMessage = createAssistantMessage({
@@ -384,6 +492,7 @@ export function renderToolResultMessage(data: Output, progressMessagesForMessage
       speed: null
     }
   });
+// 按 isTranscriptMode 决定渲染详略：展开时多显示 API 调用路径、prompt、完整 transcript、最终回复
   return <Box flexDirection="column">
       {"external" === 'ant' && <MessageResponse>
           <Text color="warning">
@@ -408,6 +517,9 @@ export function renderToolResultMessage(data: Output, progressMessagesForMessage
         </Text>}
     </Box>;
 }
+/**
+ * 渲染「正在调用」状态。有 description 就显示它（否则什么都不显示）。
+ */
 export function renderToolUseMessage({
   description,
   prompt
@@ -420,6 +532,10 @@ export function renderToolUseMessage({
   }
   return description;
 }
+/**
+ * 渲染工具标签（比如子 Agent 用了不同的模型时，在标题旁标一个模型名）。
+ * 只有和主循环模型**不一样**时才标——一样的话标出来是噪音。
+ */
 export function renderToolUseTag(input: Partial<{
   description: string;
   prompt: string;
@@ -442,6 +558,19 @@ export function renderToolUseTag(input: Partial<{
   return <>{tags}</>;
 }
 const INITIALIZING_TEXT = 'Initializing…';
+/**
+ * 渲染子 Agent **运行中**的实时进度——本文件最复杂的一个函数。
+ *
+ * 关键步骤：
+ *   ① 一条进度消息都还没有 → 显示「Initializing…」
+ *   ② 终端太矮（估算行数放不下）→ 极简模式：只显示「In progress… · N tool uses · X tokens」
+ *   ③ 否则折叠连续的搜索/读取成摘要，只显示最后 3 条，被折叠的计成「+N more tool uses」
+ *   ④ 折叠后一条都不剩（比如只发出一个搜索的 tool_use 还没回来）→ 退回「Initializing…」，
+ *      否则 MessageResponse 会渲染出一个光秃秃的 ⎿ 符号
+ *
+ * @param terminalSize 当前终端尺寸，用于判断是否启用极简模式（防止动态内容抖动）
+ * @param inProgressToolCallCount 同时进行中的工具调用数，用于估算需要多少行
+ */
 export function renderToolUseProgressMessage(progressMessages: ProgressMessage<Progress>[], {
   tools,
   verbose,
@@ -487,6 +616,7 @@ export function renderToolUseProgressMessage(progressMessages: ProgressMessage<P
       tokens
     };
   };
+// 极简模式：避免终端高度不够时动态内容反复重排造成闪烁
   if (shouldUseCondensedMode) {
     const {
       toolUseCount,
@@ -507,12 +637,15 @@ export function renderToolUseProgressMessage(progressMessages: ProgressMessage<P
   const processedMessages = processProgressMessages(progressMessages, tools, true);
 
   // For display, take the last few processed messages
+// 只显示最后 3 条（非展开态）；展开态显示全部
   const displayedMessages = isTranscriptMode ? processedMessages : processedMessages.slice(-MAX_PROGRESS_MESSAGES_TO_SHOW);
 
   // Count hidden tool uses specifically (not all messages) to match the
   // final "Done (N tool uses)" count. Each tool use generates multiple
   // progress messages (tool_use + tool_result + text), so counting all
   // hidden messages inflates the number shown to the user.
+// 隐藏条数只按「工具调用次数」统计，不按消息条数——一次工具调用会产生多条进度消息
+// （tool_use + tool_result + 文本），按消息数统计会让用户看到的数字比实际大好几倍
   const hiddenMessages = isTranscriptMode ? [] : processedMessages.slice(0, Math.max(0, processedMessages.length - MAX_PROGRESS_MESSAGES_TO_SHOW));
   const hiddenToolUseCount = count(hiddenMessages, m => {
     if (m.type === 'summary') {
@@ -531,6 +664,8 @@ export function renderToolUseProgressMessage(progressMessages: ProgressMessage<P
   // far is an assistant tool_use for a search/read op (grouped but not yet
   // counted, since counts increment on tool_result). Fall back to the
   // initializing text so MessageResponse doesn't render a bare ⎿.
+// 折叠后可能一条都不剩：目前只有一个搜索的 tool_use 发出去了，
+// 但计数是在 tool_result 时才加的，所以既没计数也没消息 → 退回 Initializing
   if (displayedMessages.length === 0 && !(isTranscriptMode && prompt)) {
     return <MessageResponse height={1}>
         <Text dimColor>{INITIALIZING_TEXT}</Text>
@@ -568,6 +703,9 @@ export function renderToolUseProgressMessage(progressMessages: ProgressMessage<P
       </Box>
     </MessageResponse>;
 }
+/**
+ * 渲染「被拒绝」状态：先照常显示进度（agent 可能已经跑了一会），再叠加拒绝提示。
+ */
 export function renderToolUseRejectedMessage(_input: {
   description: string;
   prompt: string;
@@ -604,6 +742,9 @@ export function renderToolUseRejectedMessage(_input: {
       <FallbackToolUseRejectedMessage />
     </>;
 }
+/**
+ * 渲染「出错」状态：先照常显示进度，再叠加错误块。
+ */
 export function renderToolUseErrorMessage(result: ToolResultBlockParam['content'], {
   progressMessagesForMessage,
   tools,
@@ -624,6 +765,10 @@ export function renderToolUseErrorMessage(result: ToolResultBlockParam['content'
       <FallbackToolUseErrorMessage result={result} verbose={verbose} />
     </>;
 }
+/**
+ * 统计一组进度消息的工具调用次数和 token 数（给分组显示用）。
+ * 这里数的是 tool_result（和上面 processProgressMessages 保持一致口径）。
+ */
 function calculateAgentStats(progressMessages: ProgressMessage<Progress>[]): {
   toolUseCount: number;
   tokens: number | null;
@@ -646,6 +791,12 @@ function calculateAgentStats(progressMessages: ProgressMessage<Progress>[]): {
     tokens
   };
 }
+/**
+ * 一次起了多个子 Agent 时的**分组显示**：
+ * 顶行显示「Running 3 agents…」/「3 agents finished」/「3 background agents launched」，
+ * 每个子 Agent 一行 AgentProgressLine（类型、描述、工具次数、token、颜色、最后在用的工具）。
+ * @returns 没有内容时返回 null（React 里返回 null 表示不渲染）
+ */
 export function renderGroupedAgentToolUse(toolUses: Array<{
   param: ToolUseBlockParam;
   isResolved: boolean;
@@ -679,6 +830,8 @@ export function renderGroupedAgentToolUse(toolUses: Array<{
 
     // teammate_spawned is not part of the exported Output type (cast through unknown
     // for dead code elimination), so check via string comparison on the raw value
+// teammate_spawned 不在导出的 Output 类型里（为了 dead code elimination 被 cast 掉了），
+// 所以这里只能用字符串比较原始值来判断
     const isTeammateSpawn = result?.output?.status as string === 'teammate_spawned';
 
     // For teammate spawns, show @name with type in parens and description as status
@@ -730,6 +883,7 @@ export function renderGroupedAgentToolUse(toolUses: Array<{
   const allComplete = !anyUnresolved;
 
   // Check if all agents are the same type
+// 全部同类型时只显示一次类型名（避免每行都重复 Explore/Explore/Explore）
   const allSameType = agentStats.length > 0 && agentStats.every(stat => stat.agentType === agentStats[0]?.agentType);
   const commonType = allSameType && agentStats[0]?.agentType !== 'Agent' ? agentStats[0]?.agentType : null;
 
@@ -757,6 +911,10 @@ export function renderGroupedAgentToolUse(toolUses: Array<{
       {agentStats.map((stat, index) => <AgentProgressLine key={stat.id} agentType={stat.agentType} description={stat.description} descriptionColor={stat.descriptionColor} taskDescription={stat.taskDescription} toolUseCount={stat.toolUseCount} tokens={stat.tokens} color={stat.color} isLast={index === agentStats.length - 1} isResolved={stat.isResolved} isError={stat.isError} isAsync={stat.isAsync} shouldAnimate={shouldAnimate} lastToolInfo={stat.lastToolInfo} hideType={allSameType} name={stat.name} />)}
     </Box>;
 }
+/**
+ * 主 Agent 那边显示的 agent 名字。general-purpose 和 worker 都统一显示成 'Agent'，
+ * 这两个是「默认/通配」类型，显示出来对用户没有信息量。
+ */
 export function userFacingName(input: Partial<{
   description: string;
   prompt: string;
@@ -773,6 +931,9 @@ export function userFacingName(input: Partial<{
   }
   return 'Agent';
 }
+/**
+ * 取这个 agent 类型对应的显示颜色（返回 Theme 里的颜色键名）。
+ */
 export function userFacingNameBackgroundColor(input: Partial<{
   description: string;
   prompt: string;
@@ -785,6 +946,12 @@ export function userFacingNameBackgroundColor(input: Partial<{
   // Get the color for this agent
   return getAgentColor(input.subagent_type) as keyof Theme | undefined;
 }
+/**
+ * 从进度消息里推断「最后在用什么工具」的可读描述，用于进度行尾。
+ * 优先：末尾连续 2 次以上的搜索/读取 → 显示「Read 3 files · Searched 5」这类摘要；
+ * 否则找最后一个 tool_result，反查它的 tool_use，用工具自己的 getToolUseSummary() 生成描述
+ * （比如 `Read: src/a.ts`），拿不到就退回工具的 userFacingName。
+ */
 export function extractLastToolInfo(progressMessages: ProgressMessage<Progress>[], tools: Tools): string | null {
   // Build tool_use lookup from all progress messages (needed for reverse iteration)
   const toolUseByID = new Map<string, ToolUseBlockParam>();
@@ -804,6 +971,7 @@ export function extractLastToolInfo(progressMessages: ProgressMessage<Progress>[
   // Count trailing consecutive search/read operations from the end
   let searchCount = 0;
   let readCount = 0;
+// 倒着遍历，统计末尾连续的同质操作（遇到非搜索/读就 break）
   for (let i = progressMessages.length - 1; i >= 0; i--) {
     const msg = progressMessages[i]!;
     if (!hasProgressMessage(msg.data)) {
@@ -866,6 +1034,11 @@ export function extractLastToolInfo(progressMessages: ProgressMessage<Progress>[
   }
   return null;
 }
+/**
+ * 类型谓词：subagentType 是不是「自定义 agent 类型」
+ * （既不是 general-purpose 也不是 worker —— 那两个是内置的默认类型）。
+ * `!!x` 是双重取反，把任意值强转成 boolean（≈ Boolean.valueOf(x != null && x != '')）。
+ */
 function isCustomSubagentType(subagentType: string | undefined): subagentType is string {
   return !!subagentType && subagentType !== GENERAL_PURPOSE_AGENT.agentType && subagentType !== 'worker';
 }

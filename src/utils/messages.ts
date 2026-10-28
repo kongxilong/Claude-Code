@@ -1,3 +1,101 @@
+/**
+ * 【一句话定位】Claude Code 的「消息中枢」：定义并构造会话里流动的每一条消息，
+ * 并在把消息发给 API 之前做一轮彻底的归一化（拆分、合并、排序、修补、清理）。
+ * 这是整个代码库里最核心、也被引用最多的工具模块之一。
+ *
+ * 【在架构中的位置】
+ *   上游（谁调用本文件）：
+ *     src/query.ts / QueryEngine.ts —— 主循环：收到用户输入 → createUserMessage；
+ *                                      发请求前 → normalizeMessagesForAPI；收到响应 → normalizeContentFromAPI
+ *     src/services/tools/toolExecution.ts —— 工具执行完用 createUserMessage(toolUseResult) 造 tool_result；
+ *                                            权限被拒时用 REJECT_MESSAGE 等常量
+ *     REPL 渲染层（Messages.tsx）—— 用 normalizeMessages / buildMessageLookups / reorderMessagesInUI 来展示
+ *     src/services/compact/*    —— 压缩上下文时用 createCompactBoundaryMessage 等打标记
+ *   下游（本文件依赖谁）：
+ *     ./types/message.js —— 各种消息的类型定义（Message、UserMessage、AssistantMessage ...）
+ *     ../Tool.js —— 工具对象（为了调用 mapToolResultToToolResultBlockParam、normalizeToolInput 等）
+ *     @anthropic-ai/sdk —— API 的内容块类型（tool_use / tool_result / thinking ...）
+ *   调用链（一轮对话里的消息流）：
+ *     用户输入 → createUserMessage() → 存入 messages[]
+ *       → 发请求前 normalizeMessagesForAPI()（归一化、合并、修补）→ 发给模型
+ *       → 模型流式返回 → handleMessageFromStream() 增量更新 UI
+ *       → 完整响应 → normalizeContentFromAPI()（解析工具入参 JSON）→ 存回 messages[]
+ *       → 工具执行 → createUserMessage({ toolUseResult }) 造 tool_result → 下一轮
+ *
+ * 【消息类型体系】（这是理解本文件的钥匙）
+ *   Message 是一个【可辨识联合】，每种消息都靠 type 字段区分（≈ Java sealed interface）：
+ *     type='user'         用户消息。注意：tool_result 也是 user 消息！API 里工具结果是以 user 角色回灌的。
+ *                         带 isMeta=true 表示「不是真人敲的」（系统/命令/工具结果），UI 默认不展示。
+ *     type='assistant'    模型消息。content 里可能有 text / thinking / tool_use 等块。
+ *                         带 isApiErrorMessage=true 表示这是一条「API 出错」的合成消息。
+ *     type='attachment'   附件型消息。不发给 API 本体，而是由 normalizeAttachmentForAPI 翻译成一条或多条
+ *                         user 消息。典型：文件内容、目录列表、hook 输出、CLAUDE.md、memory、todo。
+ *     type='system'       纯 UI/本地消息，永不出网。细分 subtype：informational / local_command /
+ *                         api_error / compact_boundary / microcompact_boundary / turn_duration /
+ *                         stop_hook_summary / bridge_status / memory_saved / agents_killed / api_metrics ...
+ *                         normalizeMessagesForAPI 只保留 local_command 这一种（会转成 user 消息）。
+ *     type='progress'     工具/hook 的执行进度（Bash 每输出一行就有一条）。只用于 UI 实时刷新，不出网。
+ *     type='tombstone'    墓碑消息：不是新消息，而是「把某条旧消息删掉」的指令（用于流式回滚）。
+ *     type='tool_use_summary' —— SDK 专用：一批工具跑完后给外部消费者的一句人话摘要。
+ *   两个重要派生概念：
+ *     NormalizedMessage —— 把一条含【多个 content 块】的消息拆成「一个块一条消息」，方便 UI 逐块渲染。
+ *     isVirtual=true     —— 只用于展示、绝不出网的消息（例如 REPL 内部工具的调用）。
+ *
+ * 【本文件包含什么】（按职责分组）
+ *   一、消息构造函数（create*）：
+ *     createUserMessage / createAssistantMessage / createAssistantAPIErrorMessage
+ *     createUserInterruptionMessage / createSyntheticUserCaveatMessage / createProgressMessage
+ *     createSystemMessage / createCompactBoundaryMessage / createMicrocompactBoundaryMessage /
+ *     createCommandInputMessage / createStopHookSummaryMessage / createTurnDurationMessage /
+ *     createAwaySummaryMessage / createMemorySavedMessage / createAgentsKilledMessage /
+ *     createApiMetricsMessage / createPermissionRetryMessage / createBridgeStatusMessage /
+ *     createScheduledTaskFireMessage / createSystemAPIErrorMessage / createToolResultStopMessage /
+ *     createToolUseSummaryMessage / createModelSwitchBreadcrumbs
+ *   二、归一化（发 API 前的清洗）：
+ *     normalizeMessagesForAPI（总入口）/ normalizeMessages（拆块）/ normalizeContentFromAPI（收响应）
+ *     mergeUserMessages / mergeUserMessagesAndToolResults / mergeAssistantMessages /
+ *     mergeUserContentBlocks / mergeAdjacentUserMessages / hoistToolResults / smooshIntoToolResult
+ *     reorderAttachmentsForAPI / reorderMessagesInUI / ensureToolResultPairing / filterUnresolvedToolUses
+ *   三、过滤与修补（避免 API 400）：
+ *     filterWhitespaceOnlyAssistantMessages / filterOrphanedThinkingOnlyMessages /
+ *     filterTrailingThinkingFromLastAssistant / ensureNonEmptyAssistantContent / stripSignatureBlocks /
+ *     stripToolReferenceBlocksFromUserMessage / stripCallerFieldFromAssistantMessage / stripAdvisorBlocks
+ *   四、常量文案（拒绝/中断/取消时要回灌给模型的措辞）：
+ *     INTERRUPT_MESSAGE / CANCEL_MESSAGE / REJECT_MESSAGE / SUBAGENT_REJECT_MESSAGE /
+ *     DENIAL_WORKAROUND_GUIDANCE / AUTO_REJECT_MESSAGE / NO_RESPONSE_REQUESTED ...
+ *   五、查询与索引（给 UI 用）：
+ *     buildMessageLookups / buildSubagentLookups / getToolUseID / getSiblingToolUseIDs /
+ *     getToolResultIDs / getToolUseIDs / hasUnresolvedHooks / getLastAssistantMessage / countToolCalls
+ *   六、plan mode / auto mode 的提示词生成：
+ *     normalizeAttachmentForAPI / getPlanModeInstructions / getAutoModeInstructions / PLAN_PHASE4_CONTROL ...
+ *   七、流式处理：handleMessageFromStream（把 SSE 事件翻译成 UI 更新）
+ *
+ * 【TS 语法速查】（针对本文件实际出现的写法，Java 工程师对照看）
+ *   1. 【函数重载】：同一个函数名连续声明多次签名、最后一次才写实现体（见 normalizeMessages、
+ *     filterWhitespaceOnlyAssistantMessages）。调用时编译器按实参挑最匹配的那份签名。
+ *     ≈ Java 的同名不同参方法，但 TS 的重载只有一份实现体。
+ *   2. 【可辨识联合 + switch】：`switch (message.type) { case 'user': ... }` 之后，
+ *     编译器自动把 message 窄化成对应类型——这就是 TS 版的「模式匹配」，不需要强转。
+ *   3. 【类型谓词】`function isX(m: Message): m is UserMessage` ≈ Java instanceof 模式匹配：
+ *     用在 filter 里能直接把数组元素类型收窄。
+ *   4. `as const` —— 把值断言成【字面量类型】：`type: 'text' as const` 的类型是 'text' 而不是 string，
+ *     这样它才能塞进需要字面量的联合类型里。
+ *   5. `{...obj, field: v}` 展开 =【不可变更新】：造一个新对象、覆盖某字段，原对象不动。
+ *     本文件几乎全是这种风格（因为消息会被多处共享，直接改会出诡异 bug）。
+ *   6. `?.` / `??` / `!`：可选链（null 检查）、空值合并（仅 null/undefined 才替换）、非空断言（强制去问号）。
+ *     本文件里 `arr[i]!` 这种写法很常见——因为编译器不确定索引越界与否，用 ! 担保。
+ *   7. `.at(-1)` 取最后一个元素（Java 要写 list.get(size-1)）；`.at(-1)` 不会越界报错，返回 undefined。
+ *   8. `flatMap` ≈ Java Stream.flatMap：把「每个元素映射成数组」再摊平成一个数组。
+ *   9. `Object.fromEntries(entries)` ≈ 把 [k,v][] 变成 Map/对象；`Object.freeze(x)` ≈ 做成不可变。
+ *  10. `feature('XXX')` 是【编译期 #ifdef】，不是运行时 if：打包时求值并做死代码消除。
+ *  11. 泛型 `<T extends Message | NormalizedMessage>(messages: T[]): T[]` ≈ Java `<T extends X> List<T> f(List<T>)`。
+ *  12. `satisfies never`（见 getPlanPhase4Section）是【穷尽性检查】：
+ *     若 switch 没覆盖所有分支，把值断言成 never 会编译报错——让编译器替你守纪律。
+ *  13. 正则字面量 `/.../gs` ≈ Java 的 Pattern，末尾的 g=全局、s=让 . 匹配换行。
+ *  14. 模板字符串 `` `Result of ${tool.name}` `` ≈ Java 文本块 + String.format。
+ *  15. `Record<string, Set<string>>` ≈ Map<String, Set<String>>。
+ *  16. `catch { ... }`（不带参数）是可选 catch 绑定：不关心错误对象时省略。
+ */
 import { feature } from 'bun:bundle'
 import type { BetaUsage as Usage } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import type {
@@ -163,6 +261,8 @@ import { escapeRegExp } from './stringUtils.js'
 import { isTodoV2Enabled } from './tasks.js'
 
 // Lazy import to avoid circular dependency (teammateMailbox -> teammate -> ... -> messages)
+// 又是【惰性 require】：teammateMailbox 那条依赖链最终会绕回 messages.ts，
+// 顶层 import 会形成循环依赖，包成函数延迟加载即可绕开。
 function getTeammateMailbox(): typeof import('./teammateMailbox.js') {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   return require('./teammateMailbox.js')
@@ -173,14 +273,20 @@ import {
   isToolSearchEnabledOptimistic,
 } from './toolSearch.js'
 
+// 追加在「拒绝/取消」类消息末尾的提示：提醒模型注意用户可能在纠正它，值得记到 memory 里。
 const MEMORY_CORRECTION_HINT =
   "\n\nNote: The user's next message may contain a correction or preference. Pay close attention — if they explain what went wrong or how they'd prefer you to work, consider saving that to memory for future sessions."
 
 const TOOL_REFERENCE_TURN_BOUNDARY = 'Tool loaded.'
+// 老式工具引用（tool_reference）展开后需要一个「轮次边界」标记，避免模型把两段连续的人类话语当成一轮。
 
 /**
  * Appends a memory correction hint to a rejection/cancellation message
  * when auto-memory is enabled and the GrowthBook flag is on.
+ */
+/** 给拒绝 / 取消类文案追加「记忆纠正」提示（仅当自动记忆功能开启时）。
+ *  为什么需要：用户拒绝时往往伴随着「你别这么做，应该那样做」的纠正，
+ *  这正是值得记进 memory 的偏好信息，所以顺手提醒模型留意。
  */
 export function withMemoryCorrectionHint(message: string): string {
   if (
@@ -197,6 +303,11 @@ export function withMemoryCorrectionHint(message: string): string {
  * Used for snip tool referencing — injected into API-bound messages as [id:...] tags.
  * Deterministic: same UUID always produces the same short ID.
  */
+/** 从 UUID 推导出一个稳定的 6 位短 ID（base36），用于 snip 工具引用消息。
+ *  为什么不用 UUID 本身：短 ID 塞进 [id:xxx] 标记里更省 token；
+ *  为什么必须【确定性】：同一个 UUID 每次都要得到同一个短 ID，否则模型引用会错位。
+ *  步骤：去掉横杠 → 取前 10 个十六进制字符 → 按 16 进制解析 → 转 36 进制 → 取前 6 位。
+ */
 export function deriveShortMessageId(uuid: string): string {
   // Take first 10 hex chars from the UUID (skipping dashes)
   const hex = uuid.replace(/-/g, '').slice(0, 10)
@@ -204,6 +315,8 @@ export function deriveShortMessageId(uuid: string): string {
   return parseInt(hex, 16).toString(36).slice(0, 6)
 }
 
+// ── 下面这一组是「回灌给模型的标准措辞」常量 ──
+// 它们不是给用户看的，而是作为 tool_result 的内容回给模型，明确告诉它「刚才那次调用被中断/拒绝了，别再试」。
 export const INTERRUPT_MESSAGE = '[Request interrupted by user]'
 export const INTERRUPT_MESSAGE_FOR_TOOL_USE =
   '[Request interrupted by user for tool use]'
@@ -237,12 +350,16 @@ export function AUTO_REJECT_MESSAGE(toolName: string): string {
 export function DONT_ASK_REJECT_MESSAGE(toolName: string): string {
   return `Permission to use ${toolName} has been denied because Claude Code is running in don't ask mode. ${DENIAL_WORKAROUND_GUIDANCE}`
 }
+// NO_RESPONSE_REQUESTED：用于「不需要模型再说话」的场景（如只执行命令），避免模型画蛇添足地回一句。
 export const NO_RESPONSE_REQUESTED = 'No response requested.'
 
 // Synthetic tool_result content inserted by ensureToolResultPairing when a
 // tool_use block has no matching tool_result. Exported so HFI submission can
 // reject any payload containing it — placeholder satisfies pairing structurally
 // but the content is fake, which poisons training data if submitted.
+// 合成占位结果：当某个 tool_use 找不到配对的 tool_result 时，用它补位以满足 API 的配对要求。
+// 上方英文注释强调了一个重要约束：它只是【结构上】满足配对，内容是假的，
+// 所以绝不能被提交去当训练数据——导出时会专门检查并拒绝含此占位符的 payload。
 export const SYNTHETIC_TOOL_RESULT_PLACEHOLDER =
   '[Tool result missing due to internal error]'
 
@@ -254,6 +371,9 @@ const AUTO_MODE_REJECTION_PREFIX =
  * Check if a tool result message is a classifier denial.
  * Used by the UI to render a short summary instead of the full message.
  */
+/** 判断一段 tool_result 文本是不是「auto 模式分类器拒绝」。
+ *  判据就是前缀匹配。UI 靠它把这类拒绝渲染成一行简短摘要，而不是把整段长文案铺在屏幕上。
+ */
 export function isClassifierDenial(content: string): boolean {
   return content.startsWith(AUTO_MODE_REJECTION_PREFIX)
 }
@@ -264,6 +384,11 @@ export function isClassifierDenial(content: string): boolean {
  *
  * @param reason - The classifier's reason for denying the action
  */
+/** 构造 auto 模式（分类器）拒绝时回给模型的文案。
+ *  入参 reason：分类器给出的拒绝理由
+ *  文案的三层意思：① 告诉它为什么被拒 ② 让它先去做别的、别卡住 ③ 提示用户可以加权限规则放行
+ *  第三段根据 BASH_CLASSIFIER 开关有两种措辞（编译期分支，二选一，不会同时存在）。
+ */
 export function buildYoloRejectionMessage(reason: string): string {
   const prefix = AUTO_MODE_REJECTION_PREFIX
 
@@ -272,6 +397,7 @@ export function buildYoloRejectionMessage(reason: string): string {
       `Bash(prompt: <description of allowed action>) to their settings. ` +
       `At the end of your session, recommend what permission rules to add so you don't get blocked again.`
     : `To allow this type of action in the future, the user can add a Bash permission rule to their settings.`
+// feature('BASH_CLASSIFIER') 是编译期开关：打包时就定死了走哪个分支，运行时不会两个都算。
 
   return (
     `${prefix}${reason}. ` +
@@ -285,6 +411,10 @@ export function buildYoloRejectionMessage(reason: string): string {
  * Build a message for when the auto mode classifier is temporarily unavailable.
  * Tells the agent to wait and retry, and suggests working on other tasks.
  */
+/** 分类器「临时不可用」时的文案（区别于「拒绝」）。
+ *  关键区别在于引导行为：不可用时让模型【稍等重试】，而不是放弃或绕路；
+ *  同时明确说明只读操作不受影响，避免模型连读文件都不敢做。
+ */
 export function buildClassifierUnavailableMessage(
   toolName: string,
   classifierModel: string,
@@ -297,8 +427,10 @@ export function buildClassifierUnavailableMessage(
   )
 }
 
+// 合成消息的「模型名」占位：本地造出来的消息（不是模型真生成的）一律用它，便于识别与过滤。
 export const SYNTHETIC_MODEL = '<synthetic>'
 
+// 所有「合成文案」的集合：判断一条消息是不是我们自己造的（而不是用户或模型说的）就靠它。
 export const SYNTHETIC_MESSAGES = new Set([
   INTERRUPT_MESSAGE,
   INTERRUPT_MESSAGE_FOR_TOOL_USE,
@@ -307,6 +439,10 @@ export const SYNTHETIC_MESSAGES = new Set([
   NO_RESPONSE_REQUESTED,
 ])
 
+/** 判断一条消息是不是「合成消息」（程序造的，而非用户/模型产生的）。
+ *  判据：不是 progress/attachment/system 三类，且第一个 content 块是文本、内容正好等于某个合成常量。
+ *  用途：压缩、去重、以及「不要把合成消息当成真实对话内容」的各种判断。
+ */
 export function isSyntheticMessage(message: Message): boolean {
   return (
     message.type !== 'progress' &&
@@ -318,6 +454,10 @@ export function isSyntheticMessage(message: Message): boolean {
   )
 }
 
+/** 判断是不是「合成 API 错误消息」：assistant 类型 + isApiErrorMessage 标记 + 模型名是 <synthetic>。
+ *  返回类型用了类型谓词 `message is AssistantMessage & { isApiErrorMessage: true }`，
+ *  这样调用方拿到之后可以直接访问相关字段而不用再做类型断言。
+ */
 function isSyntheticApiErrorMessage(
   message: Message,
 ): message is AssistantMessage & { isApiErrorMessage: true } {
@@ -328,16 +468,23 @@ function isSyntheticApiErrorMessage(
   )
 }
 
+/** 取最后一条 assistant 消息（没有则返回 undefined）。
+ */
 export function getLastAssistantMessage(
   messages: Message[],
 ): AssistantMessage | undefined {
   // findLast exits early from the end — much faster than filter + last for
   // large message arrays (called on every REPL render via useFeedbackSurvey).
+// findLast 从尾部开始找、命中即停：消息数组可能很长，而这个函数在每次 REPL 渲染时都会被调用，
+// 用 filter().pop() 那种写法要遍历整个数组，明显更慢（见上方英文注释）。
   return messages.findLast(
     (msg): msg is AssistantMessage => msg.type === 'assistant',
   )
 }
 
+/** 从后往前找最近一条 assistant 消息，判断它是否包含 tool_use（即「模型是不是刚点名了工具」）。
+ *  为什么倒着找：只要最近一次模型输出里有工具调用就够了，找到即可返回。
+ */
 export function hasToolCallsInLastAssistantTurn(messages: Message[]): boolean {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i]
@@ -352,6 +499,12 @@ export function hasToolCallsInLastAssistantTurn(messages: Message[]): boolean {
   return false
 }
 
+/** 【所有 assistant 消息的构造底座】造一条 assistant 消息对象。
+ *  为什么要有 base + 两个包装函数：createAssistantMessage 与 createAssistantAPIErrorMessage 只差几个字段，
+ *  共用底座可以避免两处重复维护 usage 默认值等样板。
+ *  默认值里 usage 全 0：本地造的消息没有真实 token 消耗，但字段必须齐全（否则下游统计会炸）。
+ *  入参：content（内容块数组）、isApiErrorMessage、apiError、error、errorDetails、isVirtual、usage
+ */
 function baseCreateAssistantMessage({
   content,
   isApiErrorMessage = false,
@@ -408,6 +561,11 @@ function baseCreateAssistantMessage({
   }
 }
 
+/** 造一条普通 assistant 消息（文本内容或内容块数组均可）。
+ *  入参 content：字符串（会自动包成一个 text 块）或内容块数组
+ *  入参 isVirtual：true 表示这条只用于展示、绝不发给 API（如 REPL 内部工具调用）
+ *  细节：内容为空字符串时会替换成 NO_CONTENT_MESSAGE——API 不接受空文本块。
+ */
 export function createAssistantMessage({
   content,
   usage,
@@ -432,6 +590,10 @@ export function createAssistantMessage({
   })
 }
 
+/** 造一条「API 出错」的 assistant 消息：把错误以模型能看懂的方式记进对话里，
+ *  这样模型知道刚才那次请求失败了（而不是莫名其妙没有回复）。
+ *  它会带 isApiErrorMessage 标记，后续 normalizeMessagesForAPI 会把它剔除（错误不该回传给 API）。
+ */
 export function createAssistantAPIErrorMessage({
   content,
   apiError,
@@ -457,6 +619,22 @@ export function createAssistantAPIErrorMessage({
   })
 }
 
+/** 【最核心的构造函数】造一条 user 消息。
+ *  注意：在 Anthropic 的 API 里，tool_result（工具结果）也是以 user 角色回灌的，
+ *  所以「user 消息」并不等于「人敲的字」——要看 isMeta 标志才能区分。
+ *  重要入参：
+ *    content            文本内容或内容块数组；为空时自动填 NO_CONTENT_MESSAGE（API 拒收空消息）
+ *    isMeta             true 表示「不是真人输入的」：系统上下文、命令输出、工具结果等，UI 默认不展示
+ *    isVisibleInTranscriptOnly 只在 transcript（完整历史）里显示，普通视图里不显示
+ *    isVirtual          纯展示用、绝不出网（REPL 内层调用等），发 API 前会被过滤掉
+ *    isCompactSummary   这条是上下文压缩后的摘要
+ *    toolUseResult      工具返回的原始结果对象（保留结构化数据，供 UI 渲染用）
+ *    mcpMeta            MCP 协议的元数据，只给 SDK 消费者看，绝不发给模型
+ *    sourceToolAssistantUUID 本条 tool_result 对应的那条 assistant 消息的 UUID（配对用）
+ *    permissionMode     发出时的权限模式（rewind 回退时要还原）
+ *    origin             消息来源（真人键盘 / 后台任务通知 / coordinator / 外部频道），默认是真人
+ *  两个小细节：uuid 不传就随机生成；timestamp 用 ?? 兜底当前时间（?? 只在 null/undefined 时生效）。
+ */
 export function createUserMessage({
   content,
   isMeta,
@@ -522,6 +700,9 @@ export function createUserMessage({
   return m
 }
 
+/** 把用户输入的字符串与前面的内容块拼在一起（前面没有块就直接返回字符串本身）。
+ *  用途：粘贴图片等场景下，前面已经有 image 块了，要把文字追加在后面，而不是丢掉那些块。
+ */
 export function prepareUserContent({
   inputString,
   precedingInputBlocks,
@@ -542,6 +723,10 @@ export function prepareUserContent({
   ]
 }
 
+/** 造一条「用户中断」消息：把用户按了 ESC / Ctrl-C 这件事以消息形式记进对话。
+ *  入参 toolUse：true 表示中断发生在工具调用期间（两种文案略有不同）。
+ *  为什么要记成消息而不是直接丢弃：模型需要知道自己被打断了，否则下次会以为上一轮是正常结束。
+ */
 export function createUserInterruptionMessage({
   toolUse = false,
 }: {
@@ -569,9 +754,13 @@ export function createSyntheticUserCaveatMessage(): UserMessage {
     isMeta: true,
   })
 }
+// createSyntheticUserCaveatMessage 每次都要【新建】一条消息：消息必须有唯一 uuid，
+// 复用同一个对象会让去重逻辑误判（见上方英文注释）。
 
 /**
  * Formats the command-input breadcrumb the model sees when a slash command runs.
+ */
+/** 生成斜杠命令的「面包屑」XML 标签（命令名 + 参数），让模型看到「用户刚执行了 /xxx」。
  */
 export function formatCommandInputTags(
   commandName: string,
@@ -587,6 +776,10 @@ export function formatCommandInputTags(
  * so the model can see mid-conversation switches. Same shape the CLI's
  * /model command produces via processSlashCommand.
  */
+/** 造一组「切换模型」的面包屑消息（SDK 的 set_model 控制指令用）。
+ *  为什么要造三条：caveat（免责说明）+ 命令输入 + 命令输出，
+ *  这样呈现给模型的形状与用户在 CLI 里敲 /model 完全一致——保持上下文形状一致，模型才不会困惑。
+ */
 export function createModelSwitchBreadcrumbs(
   modelArg: string,
   resolvedDisplay: string,
@@ -600,6 +793,11 @@ export function createModelSwitchBreadcrumbs(
   ]
 }
 
+/** 造一条进度消息（工具或 hook 执行中的实时进度）。
+ *  泛型 P 约束为 Progress：不同工具有不同形状的进度数据（Bash 的行输出、Agent 的子任务状态...）。
+ *  toolUseID 是这条进度属于哪个工具调用；parentToolUseID 用于嵌套调用（子 agent 里的工具）。
+ *  进度消息只服务 UI 实时刷新，永远不会发给 API。
+ */
 export function createProgressMessage<P extends Progress>({
   toolUseID,
   parentToolUseID,
@@ -619,6 +817,9 @@ export function createProgressMessage<P extends Progress>({
   }
 }
 
+/** 造一个「工具被停止」的 tool_result 块（is_error=true，内容是 CANCEL_MESSAGE）。
+ *  用于工具被中断/取消时补一个结果，满足 API 的 tool_use/tool_result 配对要求。
+ */
 export function createToolResultStopMessage(
   toolUseID: string,
 ): ToolResultBlockParam {
@@ -630,6 +831,13 @@ export function createToolResultStopMessage(
   }
 }
 
+/** 从一段 XML/HTML 文本里抽取指定标签的内容（支持属性、多行、并会处理嵌套层级）。
+ *  入参 html：待解析文本；tagName：标签名
+ *  返回：标签内的内容，找不到返回 null
+ *  为什么要自己处理嵌套：正则本身无法数清嵌套层级，这里用「统计匹配位置之前的开/闭标签数」来算深度，
+ *  只取深度为 0 的那次匹配——即最外层的那个标签。
+ *  用途：从用户输入里还原出 bash-input、command-name 等标签里的内容（textForResubmit 就用它）。
+ */
 export function extractTag(html: string, tagName: string): string | null {
   if (!html.trim() || !tagName.trim()) {
     return null
@@ -686,6 +894,11 @@ export function extractTag(html: string, tagName: string): string | null {
   return null
 }
 
+/** 判断一条消息是否「有实际内容」（用于决定要不要把它发出去 / 展示出来）。
+ *  progress / attachment / system 三类一律算「非空」（它们本来就不是文本内容驱动的）；
+ *  其余看 content：空白、NO_CONTENT_MESSAGE、中断标记都算「空」。
+ *  为什么需要：API 会拒绝空文本块，而模型偶尔会输出纯空白（如 \n\n），必须在发出前识别出来。
+ */
 export function isNotEmptyMessage(message: Message): boolean {
   if (
     message.type === 'progress' ||
@@ -722,12 +935,27 @@ export function isNotEmptyMessage(message: Message): boolean {
 // Deterministic UUID derivation. Produces a stable UUID-shaped string from a
 // parent UUID + content block index so that the same input always produces the
 // same key across calls. Used by normalizeMessages and synthetic message creation.
+/** 由「父 UUID + 块下标」确定性地推导出一个 UUID 形字符串。
+ *  为什么必须确定性：同一个输入每次都要得到同一个值，否则消息被重复归一化时 uuid 会漂移，
+ *  导致去重失效、transcript 无限膨胀。做法是把下标编码进 UUID 的后 12 位十六进制。
+ */
 export function deriveUUID(parentUUID: UUID, index: number): UUID {
   const hex = index.toString(16).padStart(12, '0')
   return `${parentUUID.slice(0, 24)}${hex}` as UUID
 }
 
 // Split messages, so each content block gets its own message
+/** 【归一化第一步】把「一条含多个 content 块的消息」拆成「一个块一条消息」，方便 UI 逐块渲染。
+ *  入参 messages：原始消息数组；返回：归一化后的消息数组
+ *  注意这里有【四个重载签名】（见上方连续几行 export function）：编译器按实参类型挑选，
+ *  实现体只有最后那一份。这是 TS 表达「参数与返回值类型联动」的常用手法。
+ *  关键设计（isNewChain 标志）：一旦遇到过含多个块的消息，后面所有消息都要【派生新 UUID】，
+ *  否则拆分产生的多条消息会与原消息共用 uuid，破坏唯一性（见上方英文注释）。
+ *  各类型的处理：
+ *    assistant —— 按 content 块逐个拆分，uuid 视 isNewChain 决定是否派生
+ *    user      —— 字符串内容先包成一个 text 块；数组内容按块拆分，图片块还会带上 imagePasteIds
+ *    attachment / progress / system —— 原样返回（它们本来就不是多块结构）
+ */
 export function normalizeMessages(
   messages: AssistantMessage[],
 ): NormalizedAssistantMessage[]
@@ -822,10 +1050,15 @@ export function normalizeMessages(messages: Message[]): NormalizedMessage[] {
   })
 }
 
+// 「工具调用请求」消息：归一化后的 assistant 消息，且第一个（也是唯一一个）块是 tool_use。
 type ToolUseRequestMessage = NormalizedAssistantMessage & {
   message: { content: [ToolUseBlock] }
 }
 
+/** 判断一条消息是不是「工具调用请求」（模型点名要用某个工具）。
+ *  注意上方英文注释里的坑：不能靠 stop_reason === 'tool_use' 判断——它并不总是被正确设置，
+ *  所以这里直接看 content 里有没有 tool_use 块。
+ */
 export function isToolUseRequestMessage(
   message: Message,
 ): message is ToolUseRequestMessage {
@@ -836,10 +1069,14 @@ export function isToolUseRequestMessage(
   )
 }
 
+// 「工具结果」消息：归一化后的 user 消息，且块是 tool_result。
 type ToolUseResultMessage = NormalizedUserMessage & {
   message: { content: [ToolResultBlockParam] }
 }
 
+/** 判断一条消息是不是「工具结果」。
+ *  两种判据任一成立：content 第一个块是 tool_result，或者带 toolUseResult 字段（结构化结果还在）。
+ */
 export function isToolUseResultMessage(
   message: Message,
 ): message is ToolUseResultMessage {
@@ -852,6 +1089,13 @@ export function isToolUseResultMessage(
 }
 
 // Re-order, to move result messages to be after their tool use messages
+/** 【UI 排序】把消息重排成「工具调用 → PreToolUse hook → 工具结果 → PostToolUse hook」的成组顺序。
+ *  为什么要重排：流式到达时顺序可能是乱的（hook 输出和结果交错、并发工具互相穿插），
+ *  但人在屏幕上看希望「一次工具调用的所有相关消息聚在一起」。
+ *  步骤：① 第一遍按 toolUseID 把四类消息分组收集 ② 第二遍遍历原顺序，遇到 tool_use 就整组输出
+ *  ③ 顺手处理「api_error 只保留最后一条」（连续多条错误没必要全堆在屏幕上）
+ *  入参 syntheticStreamingToolUseMessages：还在流式中的工具调用，统一追加到末尾。
+ */
 export function reorderMessagesInUI(
   messages: (
     | NormalizedUserMessage
@@ -1025,6 +1269,9 @@ export function reorderMessagesInUI(
   )
 }
 
+/** 判断一条 attachment 消息是不是「hook 产生的」（共有 8 种 hook 附件类型）。
+ *  用类型谓词把类型收窄成 AttachmentMessage<HookAttachment>，之后才能安全访问 hookEvent 等字段。
+ */
 function isHookAttachmentMessage(
   message: Message,
 ): message is AttachmentMessage<HookAttachment> {
@@ -1041,6 +1288,7 @@ function isHookAttachmentMessage(
   )
 }
 
+/** 统计某个工具调用上【正在进行中】的 hook 数量（看 progress 消息里报了几个 hook_progress）。 */
 function getInProgressHookCount(
   messages: NormalizedMessage[],
   toolUseID: string,
@@ -1056,6 +1304,10 @@ function getInProgressHookCount(
   )
 }
 
+/** 统计某个工具调用上【已完成】的 hook 数量。
+ *  关键细节（见英文注释）：必须按 hookName 去重再计数——同一个 hook 可能产生多条附件消息
+ *  （比如 hook_success 和 hook_additional_context 各来一条），不去重就会把 1 个 hook 数成 2 个。
+ */
 function getResolvedHookCount(
   messages: NormalizedMessage[],
   toolUseID: string,
@@ -1076,6 +1328,9 @@ function getResolvedHookCount(
   return uniqueHookNames.size
 }
 
+/** 判断某个工具调用上的 hook 是否还有没跑完的（进行中数 > 已完成数）。
+ *  UI 靠它决定要不要继续转 spinner。
+ */
 export function hasUnresolvedHooks(
   messages: NormalizedMessage[],
   toolUseID: string,
@@ -1095,6 +1350,7 @@ export function hasUnresolvedHooks(
   return false
 }
 
+/** 收集所有 tool_result：返回 tool_use_id → 是否出错 的映射表。 */
 export function getToolResultIDs(normalizedMessages: NormalizedMessage[]): {
   [toolUseID: string]: boolean
 } {
@@ -1112,6 +1368,11 @@ export function getToolResultIDs(normalizedMessages: NormalizedMessage[]): {
   )
 }
 
+/** 找出与某次工具调用【同属一条 assistant 消息】的其它工具调用 ID（即「兄弟调用」）。
+ *  用途：模型经常一次输出多个 tool_use（并行读 5 个文件），UI 需要知道哪些是一批的，
+ *  以便合并展示或统一判断「这批是不是都跑完了」。
+ *  判据是 message.id 相同：同一条 assistant 响应里的所有 tool_use 都是兄弟。
+ */
 export function getSiblingToolUseIDs(
   message: NormalizedMessage,
   messages: Message[],
@@ -1143,6 +1404,13 @@ export function getSiblingToolUseIDs(
   )
 }
 
+/** 【UI 用的预计算索引】一次遍历把各种「消息关系」算好存起来，供渲染时 O(1) 查询。
+ *  为什么需要：渲染每一条消息都要问「它的兄弟有哪些 / 它的进度消息有哪些 / hook 跑完了吗」，
+ *  如果每条都现算一遍就是 O(n²)，消息一多界面就卡。所以【一次渲染算一遍】。
+ *  字段：siblingToolUseIDs（兄弟调用）、progressMessagesByToolUseID（进度）、
+ *  inProgressHookCounts / resolvedHookCounts（hook 计数）、toolResultByToolUseID（结果）、
+ *  toolUseByToolUseID（调用块）、resolvedToolUseIDs / erroredToolUseIDs（已解决/出错集合）。
+ */
 export type MessageLookups = {
   siblingToolUseIDs: Map<string, Set<string>>
   progressMessagesByToolUseID: Map<string, ProgressMessage[]>
@@ -1166,6 +1434,15 @@ export type MessageLookups = {
  *
  * This avoids O(n²) behavior from calling getProgressMessagesForMessage,
  * getSiblingToolUseIDs, and hasUnresolvedHooks for each message.
+ */
+/** 构建上面那份索引表。
+ *  入参 normalizedMessages：归一化后的消息（用于遍历进度、结果、hook）
+ *  入参 messages：原始消息（用于按 message.id 归并 assistant 的 tool_use）
+ *  步骤：① 先把 assistant 消息按 message.id 归并，建立「tool_use_id → 兄弟集合」
+ *       ② 单遍扫描归一化消息，分别填充进度、hook 计数、工具结果三个索引
+ *       ③ 把「已解决 hook 的名字集合」换算成计数
+ *       ④ 把「没有结果的 server/mcp 工具调用」标成出错（否则 UI 会一直转圈）
+ *  第 ④ 步有个细节：最后一条 assistant 消息要跳过——它可能还在流式输出中、结果还没到，不该标错。
  */
 export function buildMessageLookups(
   normalizedMessages: NormalizedMessage[],
@@ -1339,6 +1616,7 @@ export function buildMessageLookups(
   }
 }
 
+/** 全空的索引表：给「不需要真实索引」的静态渲染场景用（比如只渲染一条消息的预览）。 */
 /** Empty lookups for static rendering contexts that don't need real lookups. */
 export const EMPTY_LOOKUPS: MessageLookups = {
   siblingToolUseIDs: new Map(),
@@ -1362,6 +1640,8 @@ export const EMPTY_LOOKUPS: MessageLookups = {
 export const EMPTY_STRING_SET: ReadonlySet<string> = Object.freeze(
   new Set<string>(),
 )
+// 共享的空 Set 单例：渲染时大量「查不到」的路径都返回它，避免每条消息每次渲染都 new 一个空 Set。
+// 类型写成 ReadonlySet<string> 是为了在【编译期】禁止修改（Object.freeze 只是习惯性的运行时保险）。
 
 /**
  * Build lookups from subagent/skill progress messages so child tool uses
@@ -1369,6 +1649,11 @@ export const EMPTY_STRING_SET: ReadonlySet<string> = Object.freeze(
  *
  * Each progress message must have a `message` field of type
  * `AssistantMessage | NormalizedUserMessage`.
+ */
+/** 为子 agent / skill 的进度消息单独建一份简化索引。
+ *  为什么要有单独一份：子 agent 的调用不是主消息流里的 assistant/user 消息，
+ *  而是藏在进度消息的 message 字段里，得单独扫一遍才能知道它们各自是「进行中」还是「已完成」。
+ *  返回：索引表 + 仍在进行的 tool_use ID 集合（有调用但没结果 = 进行中）。
  */
 export function buildSubagentLookups(
   messages: { message: AssistantMessage | NormalizedUserMessage }[],
@@ -1418,6 +1703,7 @@ export function buildSubagentLookups(
 /**
  * Get sibling tool use IDs using pre-computed lookup. O(1).
  */
+/** 用预计算索引取「兄弟工具调用」ID 集合（O(1)）。查不到返回共享的空集合（不新建对象）。 */
 export function getSiblingToolUseIDsFromLookup(
   message: NormalizedMessage,
   lookups: MessageLookups,
@@ -1432,6 +1718,7 @@ export function getSiblingToolUseIDsFromLookup(
 /**
  * Get progress messages for a message using pre-computed lookup. O(1).
  */
+/** 用预计算索引取某次工具调用的进度消息列表（O(1)）。 */
 export function getProgressMessagesFromLookup(
   message: NormalizedMessage,
   lookups: MessageLookups,
@@ -1446,6 +1733,7 @@ export function getProgressMessagesFromLookup(
 /**
  * Check for unresolved hooks using pre-computed lookup. O(1).
  */
+/** 用预计算索引判断 hook 是否还有没跑完的（O(1)）。 */
 export function hasUnresolvedHooksFromLookup(
   toolUseID: string,
   hookEvent: HookEvent,
@@ -1458,6 +1746,7 @@ export function hasUnresolvedHooksFromLookup(
   return inProgressCount > resolvedCount
 }
 
+/** 收集所有 tool_use 的 ID（每个 assistant 消息只看第一个块，因为归一化后每消息只有一个块）。 */
 export function getToolUseIDs(
   normalizedMessages: NormalizedMessage[],
 ): Set<string> {
@@ -1478,9 +1767,16 @@ export function getToolUseIDs(
  * - A tool call result (user message with tool_result content)
  * - Any assistant message
  */
+/** 【发 API 前的重排】让 attachment 类消息「上浮」，直到撞见 assistant 消息或 tool_result 为止。
+ *  为什么要上浮：attachment 代表的是「上下文补充」（文件内容、hook 输出等），
+ *  必须紧跟在它所补充说明的那次工具结果之后，否则会插到别的地方去、语义就错了。
+ *  实现细节（性能）：倒着扫描 + push + 最后一次性 reverse，整体 O(N)；
+ *  如果在循环里用 unshift（头插）就是 O(N²)。
+ */
 export function reorderAttachmentsForAPI(messages: Message[]): Message[] {
   // We build `result` backwards (push) and reverse once at the end — O(N).
   // Using unshift inside the loop would be O(N²).
+// 倒序 push 再整体 reverse，是「避免头插 O(N²)」的经典写法。
   const result: Message[] = []
   // Attachments are pushed as we encounter them scanning bottom-up, so
   // this buffer holds them in reverse order (relative to the input array).
@@ -1526,6 +1822,9 @@ export function reorderAttachmentsForAPI(messages: Message[]): Message[] {
   return result
 }
 
+/** 判断是不是 system 消息里的 local_command 子类（本地命令的输出）。
+ *  它是唯一一种会被发给 API 的 system 消息（会转成 user 消息），所以单独判断。
+ */
 export function isSystemLocalCommandMessage(
   message: Message,
 ): message is SystemLocalCommandMessage {
@@ -1537,6 +1836,11 @@ export function isSystemLocalCommandMessage(
  * This handles the case where a session was saved with MCP tools that are no longer
  * available (e.g., MCP server was disconnected, renamed, or removed).
  * Without this filtering, the API rejects with "Tool reference not found in available tools".
+ */
+/** 剔除 tool_result 里指向【已不存在工具】的 tool_reference 块。
+ *  场景：会话里存着某个 MCP 工具的结果，但后来那个 MCP 服务器断开了/改名了。
+ *  不剔除的话 API 会直接报 Tool reference not found in available tools。
+ *  细节：如果过滤后整个块都空了，就换成一句占位文字（不能直接删掉整条消息，否则角色交替会被破坏）。
  */
 function stripUnavailableToolReferencesFromUserMessage(
   message: UserMessage,
@@ -1617,6 +1921,10 @@ function stripUnavailableToolReferencesFromUserMessage(
  * Only mutates the API-bound copy, not the stored message.
  * This lets Claude reference message IDs when calling the snip tool.
  */
+/** 给 user 消息的最后一段文本追加 [id:xxx] 标记，让模型可以用 snip 工具引用这条消息。
+ *  只改【发给 API 的副本】，不碰存储里的原始消息（原始消息必须保持干净）。
+ *  isMeta 消息不加：meta 消息是系统造的，不需要也不能被引用。
+ */
 function appendMessageTagToUserMessage(message: UserMessage): UserMessage {
   if (message.isMeta) {
     return message
@@ -1673,6 +1981,9 @@ function appendMessageTagToUserMessage(message: UserMessage): UserMessage {
  * Strips tool_reference blocks from tool_result content in a user message.
  * tool_reference blocks are only valid when the tool search beta is enabled.
  * When tool search is disabled, we need to remove these blocks to avoid API errors.
+ */
+/** 当 tool search 未启用时，剔除 tool_result 里的 tool_reference 块。
+ *  背景：tool_reference 只在 tool search beta 开启时合法，否则 API 会报错——必须清理干净。
  */
 export function stripToolReferenceBlocksFromUserMessage(
   message: UserMessage,
@@ -1739,6 +2050,10 @@ export function stripToolReferenceBlocksFromUserMessage(
  * This is intentional: this helper is used for model-specific post-processing
  * AFTER normalizeMessagesForAPI has already run, so inputs are already normalized.
  */
+/** 当 tool search 未启用时，剔除 tool_use 块上的 caller 字段（同理，属于 beta 专有字段）。
+ *  注意它【不做】入参归一化——那是 normalizeToolInputForAPI 的活。
+ *  这个函数是给「按模型做后处理」用的，跑在 normalizeMessagesForAPI 之后（见上方英文注释）。
+ */
 export function stripCallerFieldFromAssistantMessage(
   message: AssistantMessage,
 ): AssistantMessage {
@@ -1775,6 +2090,7 @@ export function stripCallerFieldFromAssistantMessage(
  * Does the content array have a tool_result block whose inner content
  * contains tool_reference (ToolSearch loaded tools)?
  */
+/** 判断一个 content 数组里是否有「含 tool_reference 的 tool_result」。 */
 function contentHasToolReference(
   content: ReadonlyArray<ContentBlockParam>,
 ): boolean {
@@ -1793,6 +2109,11 @@ function contentHasToolReference(
  * normalizeAttachmentForAPI case to remember to wrap.
  *
  * Idempotent: already-wrapped text is unchanged.
+ */
+/** 给 attachment 来源的消息统一套上 <system-reminder> 包裹。
+ *  为什么要统一包：后面的 smooshSystemReminderSiblings 靠「是否以 <system-reminder> 开头」来识别，
+ *  统一在这里包一次，就不必要求每一种 attachment 的处理分支都记得自己包。
+ *  幂等：已经包过的不重复包。
  */
 function ensureSystemReminderWrap(msg: UserMessage): UserMessage {
   const content = msg.message.content
@@ -1831,6 +2152,13 @@ function ensureSystemReminderWrap(msg: UserMessage): UserMessage {
  * removed → 0%.
  *
  * Idempotent. Pure function of shape.
+ */
+/** 【收尾清洗】把同一条 user 消息里、以 <system-reminder> 开头的文本块「揉进」最后一个 tool_result 里。
+ *  为什么要揉：这些系统提示如果作为 tool_result 的【兄弟块】存在，在线上会被渲染成
+ *  「</function_results>\n\nHuman: ...」这种结构；反复出现会教会模型在结尾自己输出 Human:，
+ *  导致 3 个 token 的空 end_turn（英文注释里记录了 A/B 实验：92% → 0%）。
+ *  哪些不揉：真实用户输入、轮次边界标记、上下文折叠摘要——它们本来就该是独立的人类轮次。
+ *  幂等，且是纯函数（只看形状、不改状态）。
  */
 function smooshSystemReminderSiblings(
   messages: (UserMessage | AssistantMessage)[],
@@ -1881,6 +2209,11 @@ function smooshSystemReminderSiblings(
  * of these 400s on every call and can't be recovered by /fork. Adjacent
  * text left behind by a stripped image is re-merged.
  */
+/** 把 is_error 的 tool_result 里的非文本块（图片等）剔掉。
+ *  原因：API 规定 is_error=true 时内容只能是文本，否则 400。
+ *  这是一道【读取侧】的兜底：老版本的 transcript 里可能已经存了这种非法结构，
+ *  不清理的话会话一恢复就每条请求都 400，而且 /fork 都救不回来。
+ */
 function sanitizeErrorToolResultContent(
   messages: (UserMessage | AssistantMessage)[],
 ): (UserMessage | AssistantMessage)[] {
@@ -1929,6 +2262,13 @@ function sanitizeErrorToolResultContent(
  *
  * Idempotent: after moving, the source has no text siblings; second pass
  * finds nothing to move.
+ */
+/** 把带 tool_reference 的消息上的文本兄弟块【搬走】，挪到后面某条不带 tool_reference 的结果消息上。
+ *  问题背景（见 #21049）：tool_reference 在服务端会展开成 <functions> 块，
+ *  如果同一条消息里还有文本兄弟，就会形成「连续两段人类话语」的异常模式，模型会照着学，
+ *  之后遇到类似结构就自己输出 stop 序列（提前收尾）。
+ *  搬去哪儿：后面第一条「有 tool_result 但没有 tool_reference」的消息。找不到目标就原地不动（安全）。
+ *  幂等：搬完之后源消息没有文本兄弟了，再跑一次无事可做。
  */
 function relocateToolReferenceSiblings(
   messages: (UserMessage | AssistantMessage)[],
@@ -1986,6 +2326,25 @@ function relocateToolReferenceSiblings(
   return result
 }
 
+/** 【发 API 前的总清洗入口】把内部的 Message[] 转成可以直接发给 API 的 (UserMessage | AssistantMessage)[]。
+ *  这是本文件最重要、也最复杂的函数。它要同时满足 API 的一大堆硬性约束：
+ *    · 角色必须交替（user / assistant / user / assistant ...）
+ *    · 每个 tool_use 必须有一个 tool_result，且 ID 唯一
+ *    · assistant 消息不能以 thinking 块结尾、内容不能为空、不能只有空白
+ *    · tool_result 必须是其所属 user 消息的【第一个】块（否则报 tool result must follow tool use）
+ *    · 不能带 API 不认识的字段（如 tool search beta 的 caller）
+ *  入参：messages（内部消息数组）、tools（当前可用工具，用于规范化工具名与入参）
+ *  主要步骤：
+ *    ① attachment 上浮重排 + 剔除 isVirtual 消息（展示专用，绝不出网）
+ *    ② 建立「错误消息 → 需要剔除的块类型」映射（PDF/图片过大等场景要回删对应块）
+ *    ③ 遍历并按类型处理：system(local_command) 转 user；user 做清理与合并；
+ *       assistant 做工具名/入参规范化并按 message.id 合并；attachment 翻译成 user 消息后合并
+ *    ④ 收尾多道清洗：搬走 tool_reference 的文本兄弟 → 剔除孤儿 thinking → 剔除尾部 thinking →
+ *       剔除纯空白 → 补非空占位 → 揉进 system-reminder → 清理 is_error 的非文本块
+ *    ⑤ （可选）给 user 消息追加 [id:xxx] 标记供 snip 工具引用
+ *    ⑥ 校验图片大小
+ *  顺序很重要：英文注释里明确写了「先剔尾部 thinking，再剔空白」——反了会留下 API 拒收的空白文本块。
+ */
 export function normalizeMessagesForAPI(
   messages: Message[],
   tools: Tools = [],
@@ -2369,6 +2728,9 @@ export function normalizeMessagesForAPI(
   return sanitized
 }
 
+/** 合并两条 user 消息，并把 tool_result 块【提到最前面】（调用 hoistToolResults）。
+ *  与 mergeUserMessages 的区别：这个版本是给 attachment 合并用的，不会做文本接缝的换行处理。
+ */
 export function mergeUserMessagesAndToolResults(
   a: UserMessage,
   b: UserMessage,
@@ -2386,6 +2748,9 @@ export function mergeUserMessagesAndToolResults(
   }
 }
 
+/** 合并两条 assistant 消息（内容块数组直接拼接）。
+ *  用在「同一条 API 响应的多个 content 块被拆成了多条消息，发回去前要并回一条」。
+ */
 export function mergeAssistantMessages(
   a: AssistantMessage,
   b: AssistantMessage,
@@ -2399,6 +2764,7 @@ export function mergeAssistantMessages(
   }
 }
 
+/** 判断一条消息是否含有 tool_result 块。 */
 function isToolResultMessage(msg: Message): boolean {
   if (msg.type !== 'user') {
     return false
@@ -2408,6 +2774,12 @@ function isToolResultMessage(msg: Message): boolean {
   return content.some(block => block.type === 'tool_result')
 }
 
+/** 合并两条相邻的 user 消息。
+ *  为什么必须合并：Bedrock 不支持连续两条 user 消息；官方 API 虽然会自己合并，
+ *  但为了保证各平台行为一致、也为了 prompt 结构稳定，这里主动合并。
+ *  细节：uuid 保留【非 meta】那条的——meta 消息（系统上下文）每次请求都是新 uuid，
+ *  如果沿用它的 uuid，由 uuid 派生的 [id:xxx] 标记就会每次都变。
+ */
 export function mergeUserMessages(a: UserMessage, b: UserMessage): UserMessage {
   const lastContent = normalizeUserTextContent(a.message.content)
   const currentContent = normalizeUserTextContent(b.message.content)
@@ -2448,6 +2820,7 @@ export function mergeUserMessages(a: UserMessage, b: UserMessage): UserMessage {
   }
 }
 
+/** 把数组里相邻的 user 消息两两合并（扫一遍即可）。 */
 function mergeAdjacentUserMessages(
   msgs: (UserMessage | AssistantMessage)[],
 ): (UserMessage | AssistantMessage)[] {
@@ -2467,6 +2840,10 @@ function mergeAdjacentUserMessages(
  * In thecontent[] list on a UserMessage, tool_result blocks much come first
  * to avoid "tool result must follow tool use" API errors.
  */
+/** 把 tool_result 块【提到 content 数组最前面】。
+ *  这是 API 的硬约束：tool_result 必须紧跟在它对应的 tool_use 之后，
+ *  如果同一条消息里 tool_result 前面夹了文本块，就会报 tool result must follow tool use。
+ */
 function hoistToolResults(content: ContentBlockParam[]): ContentBlockParam[] {
   const toolResults: ContentBlockParam[] = []
   const otherBlocks: ContentBlockParam[] = []
@@ -2482,6 +2859,7 @@ function hoistToolResults(content: ContentBlockParam[]): ContentBlockParam[] {
   return [...toolResults, ...otherBlocks]
 }
 
+/** 把 user 消息的内容统一成「内容块数组」形式（字符串就包成一个 text 块），方便后续统一处理。 */
 function normalizeUserTextContent(
   a: string | ContentBlockParam[],
 ): ContentBlockParam[] {
@@ -2502,6 +2880,12 @@ function normalizeUserTextContent(
  * `startsWith('<system-reminder>')`, and prepending to b would break that
  * when b is an SR-wrapped attachment.
  */
+/** 拼接两段内容块，并在「文本接文本」的接缝处补一个换行。
+ *  为什么要补换行：API 会把相邻文本块直接拼接、不加分隔符，
+ *  两条排队的消息 2 + 2 和 3 + 3 会变成 2 + 23 + 3（见英文注释里的例子）。
+ *  为什么换行加在【前一段末尾】而不是后一段开头：后面的分类逻辑靠 startsWith('<system-reminder>') 判断，
+ *  加在后一段开头会破坏这个判断。
+ */
 function joinTextAtSeam(
   a: ContentBlockParam[],
   b: ContentBlockParam[],
@@ -2514,6 +2898,7 @@ function joinTextAtSeam(
   return [...a, ...b]
 }
 
+// 用 Extract<> 从「tool_result 的 content 联合类型」里取出数组形态的元素类型，避免手写重复定义。
 type ToolResultContentItem = Extract<
   ToolResultBlockParam['content'],
   readonly unknown[]
@@ -2530,6 +2915,14 @@ type ToolResultContentItem = Extract<
  * - string/undefined content + all-text blocks → string (preserve legacy shape)
  * - array content with tool_reference → null
  * - otherwise → array, with adjacent text merged (notebook.ts idiom)
+ */
+/** 把若干内容块「揉进」一个 tool_result 的 content 里。
+ *  返回揉好的 tool_result；如果没法揉（遇到了 tool_reference，它不能与其它类型混放），返回 null。
+ *  三种情形：
+ *    ① 原本是字符串且新块全是文本 → 仍返回字符串（保持历史形状，省 token）
+ *    ② 原本含 tool_reference → 返回 null（服务端会 ValueError）
+ *    ③ 其它 → 统一转成数组，并把相邻的文本块合并
+ *  另外：is_error 的 tool_result 只允许文本，所以会先把非文本块滤掉。
  */
 function smooshIntoToolResult(
   tr: ToolResultBlockParam,
@@ -2597,6 +2990,13 @@ function smooshIntoToolResult(
   return { ...tr, content: merged }
 }
 
+/** 合并两段 user 内容块数组。核心逻辑是：如果前一段以 tool_result 结尾，就把后一段的其它块【揉进】那个 tool_result。
+ *  为什么这么揉（见英文注释里的 A/B 数据）：不揉的话，那些块会成为 tool_result 的兄弟，
+ *  在线上渲染成 </function_results>\n\nHuman: ...，反复出现会教会模型乱输出 Human:，
+ *  揉进去之后异常率从 92% 降到 0%。
+ *  有两个分支：未开开关时走「传统版」（只处理字符串 content + 全文本块），
+ *  开开关后走「通用版」（文本/图片/document/search_result 都能揉）。
+ */
 export function mergeUserContentBlocks(
   a: ContentBlockParam[],
   b: ContentBlockParam[],
@@ -2648,6 +3048,16 @@ export function mergeUserContentBlocks(
 
 // Sometimes the API returns empty messages (eg. "\n\n"). We need to filter these out,
 // otherwise they will give an API error when we send them to the API next time we call query().
+/** 【收响应】把 API 返回的内容块做规范化处理。
+ *  入参：contentBlocks（API 返回的内容块）、tools（用于按工具做入参修正）、agentId
+ *  主要处理：
+ *    · tool_use：入参在流式模式下是【字符串】（JSON 片段），这里递归解析成对象；
+ *      解析失败时退化成 {} 并记日志（不能因为一段坏 JSON 让整个响应作废）
+ *    · 再调用工具自己的 normalizeToolInput 做工具特有的修正（比如把旧字段名映射成新的）
+ *    · text：保持原样返回。哪怕内容是空白也不改——为了【保住 prompt cache 的字节级一致性】，
+ *      空白的清理放到展示层去做（见英文注释）
+ *    · 各类 beta 专有块（mcp_tool_use 等）原样透传
+ */
 export function normalizeContentFromAPI(
   contentBlocks: BetaMessage['content'],
   tools: Tools,
@@ -2750,6 +3160,7 @@ export function normalizeContentFromAPI(
   })
 }
 
+/** 判断一段文本是否「实质为空」：去掉那些提示类 XML 标签后只剩空白，或本身就是空消息占位符。 */
 export function isEmptyMessageText(text: string): boolean {
   return (
     stripPromptXMLTags(text).trim() === '' || text.trim() === NO_CONTENT_MESSAGE
@@ -2762,6 +3173,10 @@ export function stripPromptXMLTags(content: string): string {
   return content.replace(STRIPPED_TAGS_RE, '').trim()
 }
 
+/** 从任意一条归一化消息里取出它关联的 tool_use ID（各类型取法不同：
+ *  assistant 取 tool_use 块的 id、user 取 tool_result 的 tool_use_id、progress 取 toolUseID ...）。
+ *  取不到返回 null。这是 UI 把「结果 / 进度 / hook」对回「那次调用」的通用入口。
+ */
 export function getToolUseID(message: NormalizedMessage): string | null {
   switch (message.type) {
     case 'attachment':
@@ -2792,12 +3207,18 @@ export function getToolUseID(message: NormalizedMessage): string | null {
   }
 }
 
+/** 剔除那些「模型点名了工具、但一直没有结果」的 assistant 消息。
+ *  场景：请求被中断、工具结果丢失等，留下悬空的 tool_use，再发一次就会被 API 拒。
+ */
 export function filterUnresolvedToolUses(messages: Message[]): Message[] {
   // Collect all tool_use IDs and tool_result IDs directly from message content blocks.
   // This avoids calling normalizeMessages() which generates new UUIDs — if those
   // normalized messages were returned and later recorded to the transcript JSONL,
   // the UUID dedup would not catch them, causing exponential transcript growth on
   // every session resume.
+// 关键取舍（见上方英文注释）：这里【不调用 normalizeMessages】，而是直接从 content 块里收集 ID。
+// 因为 normalizeMessages 会生成新的 uuid，那些新消息若被写回 transcript，去重就失效了，
+// 每次恢复会话都会让 transcript 指数级膨胀。
   const toolUseIds = new Set<string>()
   const toolResultIds = new Set<string>()
 
@@ -2840,6 +3261,7 @@ export function filterUnresolvedToolUses(messages: Message[]): Message[] {
   })
 }
 
+/** 取出一条 assistant 消息里的全部文本（多个 text 块用换行拼接），没有则返回 null。 */
 export function getAssistantMessageText(message: Message): string | null {
   if (message.type !== 'assistant') {
     return null
@@ -2858,6 +3280,7 @@ export function getAssistantMessageText(message: Message): string | null {
   return null
 }
 
+/** 取出一条 user 消息里的全部文本，没有则返回 null。 */
 export function getUserMessageText(
   message: Message | NormalizedMessage,
 ): string | null {
@@ -2870,6 +3293,9 @@ export function getUserMessageText(
   return getContentText(content)
 }
 
+/** 为「重新提交上一条输入」准备文本：识别 bash-input 标签（按 bash 处理）或斜杠命令标签，
+ *  都没有就当成普通 prompt（并顺手剥掉 IDE 上下文标签）。
+ */
 export function textForResubmit(
   msg: UserMessage,
 ): { text: string; mode: 'bash' | 'prompt' } | null {
@@ -2890,6 +3316,9 @@ export function textForResubmit(
  * given separator. Works with ContentBlock, ContentBlockParam, BetaContentBlock,
  * and their readonly/DeepImmutable variants via structural typing.
  */
+/** 从内容块数组里抽取文本并用指定分隔符拼接（默认空串）。
+ *  入参用了很宽松的结构类型 `{ readonly type: string }[]`，所以各种 ContentBlock 变体都能传进来。
+ */
 export function extractTextContent(
   blocks: readonly { readonly type: string }[],
   separator = '',
@@ -2900,6 +3329,7 @@ export function extractTextContent(
     .join(separator)
 }
 
+/** 取消息内容的纯文本：字符串直接返回，数组则抽出文本块拼起来；为空返回 null。 */
 export function getContentText(
   content: string | DeepImmutable<Array<ContentBlockParam>>,
 ): string | null {
@@ -2912,12 +3342,14 @@ export function getContentText(
   return null
 }
 
+// 流式过程中的「半成品 tool_use」：还不知道完整参数，只累积到哪算哪（unparsedToolInput 是已收到的 JSON 片段）。
 export type StreamingToolUse = {
   index: number
   contentBlock: BetaToolUseBlock
   unparsedToolInput: string
 }
 
+// 流式过程中的思考内容（thinking）：isStreaming 表示还在输出，streamingEndedAt 用于计算「思考了多久」。
 export type StreamingThinking = {
   thinking: string
   isStreaming: boolean
@@ -2926,6 +3358,25 @@ export type StreamingThinking = {
 
 /**
  * Handles messages from a stream, updating response length for deltas and appending completed messages
+ */
+/** 【流式事件分发器】把 API 的 SSE 流事件翻译成 UI 更新。
+ *  这是「模型还在说话时界面就能动起来」的关键函数。
+ *  入参：
+ *    message         流过来的事件（可能是完整消息、stream_event 或 request_start）
+ *    onMessage       收到【完整消息】时回调（追加进消息列表）
+ *    onUpdateLength  收到增量文本时回调（更新 token 计数动画）
+ *    onSetStreamMode 切换 spinner 状态（thinking / responding / tool-input / tool-use ...）
+ *    onStreamingToolUses 维护「正在流式接收的工具调用」列表（参数还没收全，但可以先把工具名显示出来）
+ *    onTombstone     收到墓碑消息（删除指定消息）
+ *    onStreamingThinking / onStreamingText / onApiMetrics —— 思考内容、流式文本、首 token 耗时
+ *  处理顺序：
+ *    ① 不是流事件（即完整消息）→ 先处理 tombstone / tool_use_summary 特殊情形，再 onMessage
+ *    ② message_start → 上报首 token 耗时（ttft）
+ *    ③ message_stop → 切到 tool-use 模式并清空流式工具列表
+ *    ④ content_block_start → 按块类型切换 spinner 模式；tool_use 还会新建一个「流式工具调用」
+ *    ⑤ content_block_delta → 文本增量累加、input_json_delta 追加到对应工具的未解析入参上
+ *  一个易忽略的细节：signature_delta（思考块的签名）【不计入】长度统计——
+ *  它是加密签名不是模型输出，算进去会虚增 token 计数（见英文注释）。
  */
 export function handleMessageFromStream(
   message:
@@ -2955,6 +3406,8 @@ export function handleMessageFromStream(
     if (message.type === 'tombstone') {
       onTombstone?.(message.message)
       return
+// tombstone（墓碑）消息不是新消息，而是「把某条指定消息删掉」的指令——
+// 用于流式过程中发现前面输出有问题需要回滚。这里走 onTombstone 回调而不是 onMessage。
     }
     // Tool use summary messages are SDK-only, ignore them in stream handling
     if (message.type === 'tool_use_summary') {
@@ -3094,10 +3547,14 @@ export function handleMessageFromStream(
   }
 }
 
+/** 用 <system-reminder> 标签把一段文字包起来。
+ *  用途：区分「系统/环境给的提示」和「真人说的话」，模型因此知道这些内容不该当成用户指令。
+ */
 export function wrapInSystemReminder(content: string): string {
   return `<system-reminder>\n${content}\n</system-reminder>`
 }
 
+/** 批量给一组 user 消息套上 system-reminder 包裹。 */
 export function wrapMessagesInSystemReminder(
   messages: UserMessage[],
 ): UserMessage[] {
@@ -3133,6 +3590,7 @@ export function wrapMessagesInSystemReminder(
   })
 }
 
+/** 按场景挑一套 plan mode 提示词：子 agent 版 / 精简版 / 完整版。 */
 function getPlanModeInstructions(attachment: {
   reminderType: 'full' | 'sparse'
   isSubAgent?: boolean
@@ -3152,6 +3610,9 @@ function getPlanModeInstructions(attachment: {
 // Plan file structure experiment arms.
 // Each arm returns the full Phase 4 section so the surrounding template
 // stays a flat string interpolation with no conditionals inline.
+// 下面是 plan 文件结构的 A/B 实验四组文案（control / trim / cut / cap），
+// 每份都是完整的 Phase 4 章节，这样外层模板就能保持「纯字符串插值、不带条件分支」——
+// 选择哪一组的唯一入口是下面的 getPlanPhase4Section()。
 
 export const PLAN_PHASE4_CONTROL = `### Phase 4: Final Plan
 Goal: Write your final plan to the plan file (the only file you can edit).
@@ -3200,10 +3661,17 @@ function getPlanPhase4Section(): string {
       return PLAN_PHASE4_CONTROL
     default:
       variant satisfies never
+// `variant satisfies never`：如果以后给实验加了新分组却忘了在这里加分支，这行会编译报错——
+// 编译器替你守住 switch 的穷尽性（Java 靠 switch 表达式的语法强制，TS 靠这个惯用法）。
       return PLAN_PHASE4_CONTROL
   }
 }
 
+/** 生成 plan mode（V2）的完整提示词：告诉模型「现在只能做只读动作，把计划写进 plan 文件」。
+ *  返回一组 user 消息（已套 system-reminder）。子 agent 场景返回空数组（它有自己的指令）。
+ *  提示词里明确列了五个阶段：理解 → 设计 → 评审 → 写最终计划 → 调 ExitPlanMode，
+ *  并且强调「回合只能以提问或 ExitPlanMode 结束」——这是在约束模型的行为边界。
+ */
 function getPlanModeV2Instructions(attachment: {
   isSubAgent?: boolean
   planFilePath?: string
@@ -3296,6 +3764,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
   ])
 }
 
+/** 列出当前可用的只读工具名，供 plan mode 提示词里引用。
+ *  有个特殊情况：内部构建把 find/grep 编进了二进制、并移除了独立的 Glob/Grep 工具，
+ *  这时要改说「用 Bash 里的 find/grep」，否则提示词会指向不存在的工具。
+ */
 function getReadOnlyToolNames(): string {
   // Ant-native builds alias find/grep to embedded bfs/ugrep and remove the
   // dedicated Glob/Grep tools from the registry, so point at find/grep via
@@ -3319,6 +3791,9 @@ function getReadOnlyToolNames(): string {
  * 1. Read files and ask questions iteratively
  * 2. Build up the spec/plan file incrementally as understanding grows
  * 3. Use AskUserQuestion throughout to clarify and gather input
+ */
+/** 生成「访谈式」plan mode 提示词：不强制走 Explore/Plan agent，
+ *  而是让模型边读代码、边问用户、边把发现写进 plan 文件，循环推进直到计划成形。
  */
 function getPlanModeInterviewInstructions(attachment: {
   planFilePath?: string
@@ -3382,6 +3857,7 @@ Your turn should only end by either:
   ])
 }
 
+/** plan mode 的精简版提示词（reminderType='sparse' 时用，省 token）。 */
 function getPlanModeV2SparseInstructions(attachment: {
   planFilePath: string
 }): UserMessage[] {
@@ -3396,6 +3872,7 @@ function getPlanModeV2SparseInstructions(attachment: {
   ])
 }
 
+/** 子 agent 在 plan mode 下的提示词（与主 agent 的相比有不同约束）。 */
 function getPlanModeV2SubAgentInstructions(attachment: {
   planFilePath: string
   planExists: boolean
@@ -3416,6 +3893,7 @@ Answer the user's query comprehensively, using the ${ASK_USER_QUESTION_TOOL_NAME
   ])
 }
 
+/** 生成 auto 模式（自动批准）的提示词附件。 */
 function getAutoModeInstructions(attachment: {
   reminderType: 'full' | 'sparse'
 }): UserMessage[] {
@@ -3425,6 +3903,7 @@ function getAutoModeInstructions(attachment: {
   return getAutoModeFullInstructions()
 }
 
+/** auto 模式的完整版提示词（细分若干小节）。 */
 function getAutoModeFullInstructions(): UserMessage[] {
   const content = `## Auto Mode Active
 
@@ -3442,6 +3921,7 @@ Auto mode is active. The user chose continuous, autonomous execution. You should
   ])
 }
 
+/** auto 模式的精简版提示词。 */
 function getAutoModeSparseInstructions(): UserMessage[] {
   const content = `Auto mode still active (see full instructions earlier in conversation). Execute autonomously, minimize interruptions, prefer action over planning.`
 
@@ -3450,6 +3930,17 @@ function getAutoModeSparseInstructions(): UserMessage[] {
   ])
 }
 
+/** 【attachment → 模型可读内容】把一条 attachment 消息翻译成一组 user 消息。
+ *  这是「上下文注入」的总入口：文件内容、目录列表、CLAUDE.md、todo、hook 输出、
+ *  队友消息、团队上下文、技能发现……全都在这里变成模型能看懂的文字。
+ *  几处设计要点：
+ *    ① 大多数产物都会用 wrapMessagesInSystemReminder 包一层，表明「这是系统信息不是用户指令」
+ *    ② 文件/目录类附件会模拟成「调用了一次 Bash/Read 并拿到结果」的形状
+ *       —— 保持上下文形状与真实工具调用一致，模型更容易理解
+ *    ③ 几个特殊类型（teammate_mailbox、team_context、skill_discovery）写在 switch 之前，
+ *       因为它们要放在 feature() 编译期开关的块里（case 标签没法被开关包裹）
+ *    ④ 遇到未知类型：记一个错误日志并返回空数组（不能让一条坏附件打断整个请求）
+ */
 export function normalizeAttachmentForAPI(
   attachment: Attachment,
 ): UserMessage[] {
@@ -4285,6 +4776,11 @@ You have exited auto mode. The user may now want to interact more directly. You 
   return []
 }
 
+/** 把某个工具的返回值序列化成一条 user 消息（模拟「调用工具并得到结果」的形状）。
+ *  细节：含图片块时保留块结构；否则转成字符串，且【字符串内容直接用、不 JSON 序列化】——
+ *  因为 JSON 会把换行转成 \n，白扔掉约 1 token/换行（2000 行的文件就是 1000 个 token）。
+ *  整体包在 try/catch 里：序列化失败也要给出一句「Error」，绝不能抛出去打断请求。
+ */
 function createToolResultMessage<Output>(
   tool: Tool<AnyObject, Output>,
   toolUseResult: Output,
@@ -4322,6 +4818,7 @@ function createToolResultMessage<Output>(
   }
 }
 
+/** 造一条「调用了某工具」的 user 消息（模拟 tool_use 那一半）。与 createToolResultMessage 成对使用。 */
 function createToolUseMessage(
   toolName: string,
   input: { [key: string]: string | number },
@@ -4332,6 +4829,10 @@ function createToolUseMessage(
   })
 }
 
+/** 造一条 system 消息（informational 子类）：本地展示用，永不出网。
+ *  入参 content：文本；level：info/warn/error；toolUseID：关联的工具调用；
+ *  preventContinuation：是否阻止模型继续（例如 hook 要求停下来）
+ */
 export function createSystemMessage(
   content: string,
   level: SystemMessageLevel,
@@ -4351,6 +4852,7 @@ export function createSystemMessage(
   }
 }
 
+/** 造一条「权限重试」的 system 消息：记录用户刚刚放行了哪些命令（UI 展示用）。 */
 export function createPermissionRetryMessage(
   commands: string[],
 ): SystemPermissionRetryMessage {
@@ -4366,6 +4868,7 @@ export function createPermissionRetryMessage(
   }
 }
 
+/** 造一条 bridge（远程控制）状态消息：告诉用户 /remote-control 已生效及访问地址。 */
 export function createBridgeStatusMessage(
   url: string,
   upgradeNudge?: string,
@@ -4382,6 +4885,7 @@ export function createBridgeStatusMessage(
   }
 }
 
+/** 造一条「定时任务触发」的 system 消息。 */
 export function createScheduledTaskFireMessage(
   content: string,
 ): SystemScheduledTaskFireMessage {
@@ -4395,6 +4899,7 @@ export function createScheduledTaskFireMessage(
   }
 }
 
+/** 造一条 Stop hook 的汇总消息：跑了多少个 hook、各自耗时、有没有阻止继续等。 */
 export function createStopHookSummaryMessage(
   hookCount: number,
   hookInfos: StopHookInfo[],
@@ -4425,6 +4930,7 @@ export function createStopHookSummaryMessage(
   }
 }
 
+/** 造一条「本轮耗时」的 system 消息（同时可带上 token 预算使用情况）。 */
 export function createTurnDurationMessage(
   durationMs: number,
   budget?: { tokens: number; limit: number; nudges: number },
@@ -4444,6 +4950,7 @@ export function createTurnDurationMessage(
   }
 }
 
+/** 造一条「离开期间摘要」的 system 消息（用户离开一会儿回来时，告诉他期间发生了什么）。 */
 export function createAwaySummaryMessage(
   content: string,
 ): SystemAwaySummaryMessage {
@@ -4457,6 +4964,7 @@ export function createAwaySummaryMessage(
   }
 }
 
+/** 造一条「记忆已保存」的 system 消息（写上哪些文件被写入了）。 */
 export function createMemorySavedMessage(
   writtenPaths: string[],
 ): SystemMemorySavedMessage {
@@ -4470,6 +4978,7 @@ export function createMemorySavedMessage(
   }
 }
 
+/** 造一条「子 agent 已被全部杀掉」的 system 消息。 */
 export function createAgentsKilledMessage(): SystemAgentsKilledMessage {
   return {
     type: 'system',
@@ -4480,6 +4989,7 @@ export function createAgentsKilledMessage(): SystemAgentsKilledMessage {
   }
 }
 
+/** 造一条 API 指标消息：首 token 耗时、输出速度(otps)、各类耗时与计数（供状态栏展示）。 */
 export function createApiMetricsMessage(metrics: {
   ttftMs: number
   otps: number
@@ -4513,6 +5023,9 @@ export function createApiMetricsMessage(metrics: {
   }
 }
 
+/** 造一条「本地命令」system 消息。特别注意：这是唯一会被发给 API 的 system 消息
+ *  （normalizeMessagesForAPI 会把它转成 user 消息），因为它记录的是命令输出，模型后续要引用。
+ */
 export function createCommandInputMessage(
   content: string,
 ): SystemLocalCommandMessage {
@@ -4527,6 +5040,11 @@ export function createCommandInputMessage(
   }
 }
 
+/** 造一条【上下文压缩边界】标记消息。
+ *  它在 transcript 里起「分水岭」作用：之后取消息时只要边界之后的（见 getMessagesAfterCompactBoundary），
+ *  边界本身是 system 消息，发 API 时会被过滤掉。
+ *  入参 trigger：手动还是自动；preTokens：压缩前的 token 数；以及被压缩掉的消息数等元信息。
+ */
 export function createCompactBoundaryMessage(
   trigger: 'manual' | 'auto',
   preTokens: number,
@@ -4554,6 +5072,7 @@ export function createCompactBoundaryMessage(
   }
 }
 
+/** 造一条【微压缩】边界消息：只针对「把超大的工具结果清掉」这种轻量压缩，记录省了多少 token。 */
 export function createMicrocompactBoundaryMessage(
   trigger: 'auto',
   preTokens: number,
@@ -4582,6 +5101,7 @@ export function createMicrocompactBoundaryMessage(
   }
 }
 
+/** 造一条 API 错误的 system 消息（含重试倒计时与第几次重试）。UI 据此显示「正在重试…」。 */
 export function createSystemAPIErrorMessage(
   error: APIError,
   retryInMs: number,
@@ -4605,6 +5125,7 @@ export function createSystemAPIErrorMessage(
 /**
  * Checks if a message is a compact boundary marker
  */
+/** 判断一条消息是不是压缩边界标记。 */
 export function isCompactBoundaryMessage(
   message: Message | NormalizedMessage,
 ): message is SystemCompactBoundaryMessage {
@@ -4614,6 +5135,9 @@ export function isCompactBoundaryMessage(
 /**
  * Finds the index of the last compact boundary marker in the messages array
  * @returns The index of the last compact boundary, or -1 if none found
+ */
+/** 从后往前找最后一个压缩边界的下标，找不到返回 -1。
+ *  泛型 T 让它同时支持 Message[] 与 NormalizedMessage[]，返回原数组同类型的切片。
  */
 export function findLastCompactBoundaryIndex<
   T extends Message | NormalizedMessage,
@@ -4640,6 +5164,11 @@ export function findLastCompactBoundaryIndex<
  *
  * Note: The boundary itself is a system message and will be filtered by normalizeMessagesForAPI.
  */
+/** 取【最后一次压缩边界之后】的所有消息（含边界本身）；没有边界就返回全部。
+ *  这是「压缩后上下文」的取法：边界之前的旧对话已经被摘要取代，不该再发给模型。
+ *  另外默认还会过滤掉被 snip 掉的消息（因为 REPL 为了滚动回看保留了完整历史，
+ *  但发给模型的那条路径必须同时应用压缩切片 + snip 过滤）；传 includeSnipped 可关掉这个行为。
+ */
 export function getMessagesAfterCompactBoundary<
   T extends Message | NormalizedMessage,
 >(messages: T[], options?: { includeSnipped?: boolean }): T[] {
@@ -4655,6 +5184,11 @@ export function getMessagesAfterCompactBoundary<
   return sliced
 }
 
+/** 判断一条 user 消息该不该显示出来。
+ *  规则：meta 消息默认不显示（它们只是给模型看的上下文）；
+ *  但来自「频道（channel）」的消息例外——虽然是 meta，用户也该看到别人发来了什么。
+ *  isVisibleInTranscriptOnly 的消息只在 transcript 模式下显示。
+ */
 export function shouldShowUserMessage(
   message: NormalizedMessage,
   isTranscriptMode: boolean,
@@ -4676,6 +5210,9 @@ export function shouldShowUserMessage(
   return true
 }
 
+/** 判断一条 assistant 消息是不是「只有思考内容」（没有文本、没有工具调用）。
+ *  这类消息在展示上要特殊处理（通常折叠成一个思考指示）。
+ */
 export function isThinkingMessage(message: Message): boolean {
   if (message.type !== 'assistant') return false
   if (!Array.isArray(message.message.content)) return false
@@ -4688,6 +5225,7 @@ export function isThinkingMessage(message: Message): boolean {
  * Count total calls to a specific tool in message history
  * Stops early at maxCount for efficiency
  */
+/** 统计某个工具在历史消息里被调用了多少次；达到 maxCount 就提前返回（省时间）。 */
 export function countToolCalls(
   messages: Message[],
   toolName: string,
@@ -4715,6 +5253,9 @@ export function countToolCalls(
 /**
  * Check if the most recent tool call succeeded (has result without is_error)
  * Searches backwards for efficiency.
+ */
+/** 判断某个工具【最近一次】调用是否成功（有结果且 is_error 不为 true）。
+ *  倒着找效率更高：只看最近那次即可。
  */
 export function hasSuccessfulToolCall(
   messages: Message[],
@@ -4760,6 +5301,7 @@ export function hasSuccessfulToolCall(
   return false
 }
 
+// 思考块有四种形态（普通/被编辑过的 × SDK 的非 beta/beta 版本），这里统一成一个联合类型便于处理。
 type ThinkingBlockType =
   | ThinkingBlock
   | RedactedThinkingBlock
@@ -4768,6 +5310,7 @@ type ThinkingBlockType =
   | BetaThinkingBlock
   | BetaRedactedThinkingBlock
 
+/** 判断一个内容块是不是思考块（thinking 或 redacted_thinking）。 */
 function isThinkingBlock(
   block: ContentBlockParam | ContentBlock | BetaContentBlock,
 ): block is ThinkingBlockType {
@@ -4777,6 +5320,10 @@ function isThinkingBlock(
 /**
  * Filter trailing thinking blocks from the last message if it's an assistant message.
  * The API doesn't allow assistant messages to end with thinking/redacted_thinking blocks.
+ */
+/** 剔除【最后一条 assistant 消息】末尾的思考块。
+ *  为什么：API 不允许 assistant 消息以 thinking / redacted_thinking 结尾（用户取消时很容易留下这种半成品）。
+ *  如果整条消息只剩思考块，就补一个占位文本（不能留空内容）。
  */
 function filterTrailingThinkingFromLastAssistant(
   messages: (UserMessage | AssistantMessage)[],
@@ -4832,6 +5379,9 @@ function filterTrailingThinkingFromLastAssistant(
  * Returns true if all content blocks are text blocks with only whitespace.
  * Returns false if there are any non-text blocks (like tool_use) or text with actual content.
  */
+/** 判断 assistant 消息的内容是不是「只有空白文本」。
+ *  注意：只要出现任何一个非文本块（tool_use、thinking 等），就不算空白——那些块是有意义的。
+ */
 function hasOnlyWhitespaceTextContent(
   content: Array<{ type: string; text?: string }>,
 ): boolean {
@@ -4865,6 +5415,12 @@ function hasOnlyWhitespaceTextContent(
  * since whitespace-only content has no semantic value.
  *
  * Also used by conversationRecovery to filter these from the main state during session resume.
+ */
+/** 剔除【内容只有空白文本】的 assistant 消息。
+ *  背景：API 要求文本块必须含非空白字符；模型有时会先输出 \n\n 再进思考，用户此时取消，就留下一条空白消息。
+ *  注意这里也有【重载签名】（两种入参类型）+ 一份实现体。
+ *  副作用要留意：删掉 assistant 消息后可能留下两条相邻的 user 消息，
+ *  而 API 要求角色交替，所以末尾还要把相邻的 user 消息再合并一次。
  */
 export function filterWhitespaceOnlyAssistantMessages(
   messages: (UserMessage | AssistantMessage)[],
@@ -4930,6 +5486,10 @@ export function filterWhitespaceOnlyAssistantMessages(
  *
  * Note: Whitespace-only text content is handled separately by filterWhitespaceOnlyAssistantMessages.
  */
+/** 给【非最后一条】的 assistant 空内容消息补一个占位文本。
+ *  API 的规则是「除最后一条 assistant 消息外，所有消息都必须有非空内容」；
+ *  最后一条可以为空（那是给 prefill 留的合法情形），所以跳过它。
+ */
 function ensureNonEmptyAssistantContent(
   messages: (UserMessage | AssistantMessage)[],
 ): (UserMessage | AssistantMessage)[] {
@@ -4987,6 +5547,12 @@ function ensureNonEmptyAssistantContent(
  * A thinking-only message is "orphaned" if there is NO other assistant message with the
  * same message.id that contains non-thinking content (text, tool_use, etc). If such a
  * message exists, the thinking block will be merged with it in normalizeMessagesForAPI().
+ */
+/** 剔除【孤儿思考消息】：只有思考内容、且没有另一条同 message.id 的消息能与它合并。
+ *  背景：流式输出时每个 content 块都是一条独立的、共享同一个 message.id 的消息；
+ *  恢复会话时如果中间夹了 user 消息，合并就会失败，留下孤立的思考块，导致 API 报
+ *  thinking blocks cannot be modified。
+ *  两遍扫描：① 先收集「哪些 message.id 有非思考内容」② 再剔除那些找不到同伴的思考-only 消息。
  */
 export function filterOrphanedThinkingOnlyMessages(
   messages: (UserMessage | AssistantMessage)[],
@@ -5063,6 +5629,13 @@ export function filterOrphanedThinkingOnlyMessages(
  * generated them; after a credential change (e.g. /login) they're invalid and
  * the API rejects them with a 400.
  */
+/** 剔除所有带签名的块（thinking、redacted_thinking、connector_text）。
+ *  为什么：这些签名与【生成它时用的 API key】绑定；换凭据（比如执行了 /login）之后它们就失效了，
+ *  API 会以 400 拒绝。所以换凭据后必须先把它们清掉。
+ *  细节：即使整条消息只剩思考块也要清成空数组，而不是原样保留——
+ *  因为流式把同一条响应的各块拆成了同 id 的多条消息，后面会由 mergeAssistantMessages 再合回去；
+ *  这里保留原样的话，过期签名会在合并时「复活」。
+ */
 export function stripSignatureBlocks(messages: Message[]): Message[] {
   let changed = false
   const result = messages.map(msg => {
@@ -5102,6 +5675,9 @@ export function stripSignatureBlocks(messages: Message[]): Message[] {
  * Creates a tool use summary message for SDK emission.
  * Tool use summaries provide human-readable progress updates after tool batches complete.
  */
+/** 造一条「工具调用摘要」消息（SDK 专用）：一批工具跑完后给外部消费者的一句人话总结。
+ *  它不参与模型对话（handleMessageFromStream 里会直接忽略），只用于 SDK 事件流。
+ */
 export function createToolUseSummaryMessage(
   summary: string,
   precedingToolUseIds: string[],
@@ -5129,6 +5705,16 @@ export function createToolUseSummaryMessage(
  * collection, a model response conditioned on synthetic placeholders is
  * tainted — fail the trajectory rather than waste labeler time on a turn
  * that will be rejected at submission anyway.
+ */
+/** 【防御性校验 + 修补】确保 tool_use 与 tool_result 严格配对。
+ *  两个方向都要管：
+ *    正向：tool_use 没有对应结果 → 补一个合成的 is_error 结果（占位内容）
+ *    反向：tool_result 找不到对应的 tool_use（孤儿）→ 直接剔除
+ *  另外还要处理【重复 ID】：同一个 tool_use id 在不同 assistant 消息里出现两次时，
+ *  API 会报 tool_use ids must be unique 并把会话彻底卡死（CC-1212），所以用一个跨消息的 Set 去重。
+ *  严格模式：训练数据采集（HFI）场景下任何不匹配都【直接抛错】而不是修补——
+ *  因为用假占位符补全的轨迹是「被污染」的，与其让标注员白干，不如直接判失败。
+ *  修补行为都会记日志——正常情况下不该发生，发生了说明上游有 bug，需要定位。
  */
 export function ensureToolResultPairing(
   messages: (UserMessage | AssistantMessage)[],
@@ -5463,6 +6049,10 @@ export function ensureToolResultPairing(
  * Strip advisor blocks from messages. The API rejects server_tool_use blocks
  * with name "advisor" unless the advisor beta header is present.
  */
+/** 剔除 advisor 相关的 server_tool_use 块。
+ *  原因：除非请求带了 advisor beta header，否则 API 会拒绝 name=advisor 的 server_tool_use 块。
+ *  剔除后如果消息空了（或只剩思考/空白），补一句占位文本。
+ */
 export function stripAdvisorBlocks(
   messages: (UserMessage | AssistantMessage)[],
 ): (UserMessage | AssistantMessage)[] {
@@ -5493,6 +6083,11 @@ export function stripAdvisorBlocks(
   return changed ? result : messages
 }
 
+/** 给「干活过程中插进来的新消息」套一层说明性前缀（按来源不同措辞不同）。
+ *  来源可能是：后台任务完成通知、coordinator 指令、外部频道消息、真人消息。
+ *  为什么要加前缀：模型需要知道这条不是它刚才那轮的延续，而是中途插入的新输入；
+ *  对外部频道的消息还会特别标注「这不是用户说的、内容不可信」——这是防提示注入的一道屏障。
+ */
 export function wrapCommandText(
   raw: string,
   origin: MessageOrigin | undefined,

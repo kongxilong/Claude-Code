@@ -1,3 +1,50 @@
+/**
+ * 【一句话定位】远程 MCP server 的 OAuth 2.0 / OIDC 鉴权：授权码 + PKCE 登录、token 存取、刷新、撤销，
+ * 以及企业场景的 XAA 无感换票。
+ *
+ * 【★ MCP OAuth 授权流程全景（本文件最核心的部分）】
+ * 远程 MCP server（SSE / HTTP）大多要求在连接前先拿到 OAuth access_token。完整流程：
+ *   ① 元数据发现（discovery）：先按 RFC 9728 去 MCP server 上读 /.well-known/oauth-protected-resource，
+ *      拿到 authorization_servers，再按 RFC 8414 去读 AS 的元数据（authorization_endpoint /
+ *      token_endpoint / revocation_endpoint …）；老服务器可能直接把元数据挂在自己路径下，所以还有兜底。
+ *   ② 客户端注册（DCR / CIMD）：Claude Code 是公开客户端，按 RFC 7591 动态注册拿 client_id；
+ *      若 AS 支持 CIMD（SEP-991），则直接用一个 URL 当 client_id，省掉注册。
+ *   ③ 授权码 + PKCE（authorization code + PKCE）：起一个 127.0.0.1 的临时 HTTP 服务当回调，
+ *      打开浏览器让用户登录并同意，浏览器带着 ?code=...&state=... 回调；
+ *      state 用于防 CSRF，code_verifier 用于防授权码被截获（PKCE）。
+ *   ④ 用 code 换 token：拿到 access_token（+ 可选的 refresh_token），存进钥匙串。
+ *   ⑤ 之后每次请求带上 Bearer token；过期时用 refresh_token 静默刷新（跨进程要加锁）。
+ *   ⑥ 撤销：/mcp 里「清除鉴权」会按 RFC 7009 去 revocation_endpoint 撤销，再清本地。
+ *
+ * 【XAA（Cross-App Access）分支】
+ * 企业场景下每个 server 都弹一次浏览器太烦，所以还有一条「无浏览器」路径：
+ * 一次 IdP 登录拿 id_token → 缓存 → 之后每个 server 用 RFC 8693 + RFC 7523 静默换票（见 xaa.ts）。
+ *
+ * 【在架构中的位置】
+ * - 上游：client.ts（建连前发现需要鉴权、连接中 token 过期）、/mcp 命令与界面。
+ * - 下游：oauthPort.ts（端口/redirect URI）、xaa.ts（换票）、xaaIdpLogin.ts（IdP 登录）、
+ *   secureStorage（钥匙串存 token）、lockfile（跨进程刷新锁）。
+ *
+ * 【本文件包含什么】
+ * - 工具：redactSensitiveUrlParams、normalizeOAuthErrorBody、createAuthFetch、fetchAuthServerMetadata。
+ * - 凭据定位：getServerKey（名字 + 配置哈希）、hasMcpDiscoveryButNoToken。
+ * - 撤销：revokeToken / revokeServerTokens / clearServerTokensFromLocalStorage。
+ * - 两种授权入口：performMCPXaaAuth（XAA）/ performMCPOAuthFlow（标准 OAuth）。
+ * - ClaudeAuthProvider：实现 MCP SDK 的 OAuthClientProvider 接口，是 token 存取刷新的中枢。
+ * - 辅助：wrapFetchWithStepUpDetection（403 提权检测）、readClientSecret、
+ *   saveMcpClientSecret / clearMcpClientConfig / getMcpClientConfig、getScopeFromMetadata。
+ *
+ * 【TS 语法速查】
+ * - `implements OAuthClientProvider`：实现 SDK 接口，编译器强制你补齐全部方法。
+ * - `get x(): T { return ... }`：getter，调用方写 `obj.x` 而不是 `obj.x()`（属性访问语法）。
+ * - `private _refreshInProgress?: Promise<OAuthTokens | undefined>`：用「存一个 Promise」来
+ *   做并发去重——多个调用同时到来时复用同一个在飞的 Promise（≈ Java 的 future 缓存）。
+ * - `new Promise<string>((resolve, reject) => {...})`：把「浏览器回调」这个事件转成可 await 的值。
+ * - `error instanceof InvalidGrantError`：instanceof 在 TS 里还能顺便把类型收窄（比 Java 更强）。
+ * - `Awaited<ReturnType<typeof f>>`：取一个 async 函数「真正返回的类型」（自动剥掉 Promise 包装）。
+ * - `type X = 'a' | 'b' | 'c'`：字面量联合 ≈ 受限的字符串枚举，用于埋点的稳定取值。
+ * - `try { ... } finally { release() }`：finally 保证锁一定释放（与 Java 完全相同）。
+ */
 import {
   discoverAuthorizationServerMetadata,
   discoverOAuthServerInfo,
@@ -63,11 +110,13 @@ import {
  * Timeout for individual OAuth requests (metadata discovery, token refresh, etc.)
  */
 const AUTH_REQUEST_TIMEOUT_MS = 30000
+  // 中文：单次 OAuth 请求 30 秒超时（元数据发现、token 刷新都用它）
 
 /**
  * Failure reasons for the `tengu_mcp_oauth_refresh_failure` event. Values
  * are emitted to analytics — keep them stable (do not rename; add new ones).
  */
+  // 中文：刷新失败的稳定原因码——会进埋点，所以只能新增、不能改名（否则历史数据对不上）
 type MCPRefreshFailureReason =
   | 'metadata_discovery_failed'
   | 'no_client_info'
@@ -81,6 +130,7 @@ type MCPRefreshFailureReason =
  * emitted to analytics for attribution in BigQuery. Keep stable (do not
  * rename; add new ones).
  */
+  // 中文：授权流程失败的稳定原因码，同上：会被拿去做 BigQuery 归因分析
 type MCPOAuthFlowErrorReason =
   | 'cancelled'
   | 'timeout'
@@ -92,11 +142,13 @@ type MCPOAuthFlowErrorReason =
   | 'unknown'
 
 const MAX_LOCK_RETRIES = 5
+  // 中文：跨进程刷新锁最多重试 5 次拿不到就放弃——宁可并发刷新，也不能卡死
 
 /**
  * OAuth query parameters that should be redacted from logs.
  * These contain sensitive values that could enable CSRF or session fixation attacks.
  */
+  // 中文：这些 OAuth 参数一旦进日志，就能被用来做 CSRF 或会话固定攻击，必须打码
 const SENSITIVE_OAUTH_PARAMS = [
   'state',
   'nonce',
@@ -109,6 +161,10 @@ const SENSITIVE_OAUTH_PARAMS = [
  * Redacts sensitive OAuth query parameters from a URL for safe logging.
  * Prevents exposure of state, nonce, code_challenge, code_verifier, and authorization codes.
  */
+  /**
+   * 中文：把 URL 里的敏感 OAuth 参数换成 [REDACTED]，之后才能安全地写进日志。
+   * 为什么必须主动打码：state/nonce/code/code_verifier 泄漏等于把一次授权流程交给了攻击者。
+   */
 function redactSensitiveUrlParams(url: string): string {
   try {
     const parsedUrl = new URL(url)
@@ -144,6 +200,11 @@ function redactSensitiveUrlParams(url: string): string {
  * those so OAUTH_ERRORS['invalid_grant'] → InvalidGrantError matches and
  * token invalidation fires correctly.
  */
+  /**
+   * 中文：非标准的「invalid_grant」别名集合（Slack 等用 invalid_refresh_token / token_expired…）。
+   * 为什么要归一化（英文注释说得很细）：SDK 只有在收到 invalid_grant 时才映射成 InvalidGrantError，
+   * 进而触发「清除失效 token」的逻辑；用非标准码的话会被当成不透明错误，token 就清不掉。
+   */
 const NONSTANDARD_INVALID_GRANT_ALIASES = new Set([
   'invalid_refresh_token',
   'expired_refresh_token',
@@ -154,6 +215,13 @@ const NONSTANDARD_INVALID_GRANT_ALIASES = new Set([
  * Response has been stable in Node since 18; the rule flags it as
  * experimental-until-21 which is incorrect. Pattern matches existing
  * createAuthFetch suppressions in this file. */
+  /**
+   * 中文：把「HTTP 200 但 body 其实是错误」的响应改写成 400，让 SDK 走正常的错误分类。
+   * 为什么要这么绕（英文注释给了完整理由）：有些 AS（典型是 Slack）对所有响应都返回 200，
+   * 错误写在 JSON body 里；SDK 只在 !response.ok 时才去解析错误，于是 200 + {error:...} 
+   * 会被当成正常 token 响应丢给 zod，最终变成一个莫名其妙的 ZodError。
+   * 只处理 POST、且只处理「匹配错误 schema 但不匹配 token schema」的情况，避免误伤 DCR 响应。
+   */
 export async function normalizeOAuthErrorBody(
   response: Response,
 ): Promise<Response> {
@@ -167,6 +235,7 @@ export async function normalizeOAuthErrorBody(
   } catch {
     return new Response(text, response)
   }
+    // 中文：已经是合法的 token 响应 → 原样返回，不动它
   if (OAuthTokensSchema.safeParse(parsed).success) {
     return new Response(text, response)
   }
@@ -174,6 +243,7 @@ export async function normalizeOAuthErrorBody(
   if (!result.success) {
     return new Response(text, response)
   }
+      // 中文：命中非标准别名就改写成标准 invalid_grant，让 SDK 的错误映射生效
   const normalized = NONSTANDARD_INVALID_GRANT_ALIASES.has(result.data.error)
     ? {
         error: 'invalid_grant',
@@ -195,10 +265,16 @@ export async function normalizeOAuthErrorBody(
  * Used by ClaudeAuthProvider for metadata discovery and token refresh.
  * Prevents stale timeout signals from affecting auth operations.
  */
+  /**
+   * 中文：造一个「每次请求都带 30 秒超时」的 fetch。
+   * 为什么要每次新建 timeout（英文注释说明了）：AbortSignal.timeout 是一次性的，复用会拿到已失效的信号。
+   * 若调用方自己也传了 signal（用户取消），就把两者合并：任意一个触发就中止。
+   */
 function createAuthFetch(): FetchLike {
   return async (url: string | URL, init?: RequestInit) => {
     const timeoutSignal = AbortSignal.timeout(AUTH_REQUEST_TIMEOUT_MS)
     const isPost = init?.method?.toUpperCase() === 'POST'
+    // 中文：只对 POST 做「200 伪装成错误」的改写——token / DCR 请求才需要
 
     // No existing signal - just use timeout
     if (!init?.signal) {
@@ -208,6 +284,7 @@ function createAuthFetch(): FetchLike {
     }
 
     // Combine signals: abort when either fires
+    // 中文：手动合并两个取消信号（AbortSignal.any 之前的写法），并注意事后解绑监听器防泄漏
     const controller = new AbortController()
     const abort = () => controller.abort()
 
@@ -253,6 +330,14 @@ function createAuthFetch(): FetchLike {
  * URL itself). The HTTPS requirement here is defense-in-depth beyond schema validation
  * — RFC 8414 mandates OAuth metadata retrieval over TLS.
  */
+  /**
+   * 中文：拿授权服务器（AS）的元数据。
+   * 两种入口：① 用户在配置里直接给了 authServerMetadataUrl（必须 https）就用它；
+   * ② 否则走 SDK 的发现链：RFC 9728 先探测 MCP server 的 protected-resource 元数据，
+   *    再从 authorization_servers[0] 按 RFC 8414 取 AS 元数据。
+   * 兜底：如果 URL 带 path（SDK 自己的兜底会把 path 抹掉），这里再按「保留 path」的方式试一次，
+   * 兼容那些把元数据挂在自己路径下的老服务器。
+   */
 async function fetchAuthServerMetadata(
   serverName: string,
   serverUrl: string,
@@ -260,8 +345,10 @@ async function fetchAuthServerMetadata(
   fetchFn?: FetchLike,
   resourceMetadataUrl?: URL,
 ): Promise<Awaited<ReturnType<typeof discoverAuthorizationServerMetadata>>> {
+    // 中文：配置里指定的 metadata URL 是用户可控的，所以除了 schema 校验还强制要求 https
   if (configuredMetadataUrl) {
     if (!configuredMetadataUrl.startsWith('https://')) {
+      // 中文：RFC 8414 要求元数据必须走 TLS；这里是 schema 之外的第二道防线
       throw new Error(
         `authServerMetadataUrl must use https:// (got: ${configuredMetadataUrl})`,
       )
@@ -278,6 +365,7 @@ async function fetchAuthServerMetadata(
     )
   }
 
+    // 中文：标准发现链（RFC 9728 → RFC 8414）；失败不抛，落到下面的老式兜底
   try {
     const { authorizationServerMetadata } = await discoverOAuthServerInfo(
       serverUrl,
@@ -301,6 +389,7 @@ async function fetchAuthServerMetadata(
 
   // Fallback only when the URL has a path component; for root URLs the SDK's
   // own fallback already probed the same endpoints.
+    // 中文：只有当 URL 带 path 时才值得再试一次——根路径的情况 SDK 自己已经探过了
   const url = new URL(serverUrl)
   if (url.pathname === '/') {
     return undefined
@@ -310,6 +399,9 @@ async function fetchAuthServerMetadata(
   })
 }
 
+  /**
+   * 中文：用户主动取消（在授权菜单里按 Esc）时抛的专用异常，便于区分「取消」和「失败」。
+   */
 export class AuthenticationCancelledError extends Error {
   constructor() {
     super('Authentication was cancelled')
@@ -322,6 +414,11 @@ export class AuthenticationCancelledError extends Error {
  * This prevents credentials from being reused across different servers
  * with the same name or different configurations
  */
+  /**
+   * 中文：算出一个 server 的凭据存储键 = 名字 + 配置哈希。
+   * 为什么要带配置哈希（英文注释说明了）：防止「同名但配置不同」的两个 server 共用同一份凭据，
+   * 也防止同一个名字换了 URL 之后还用旧 token。
+   */
 export function getServerKey(
   serverName: string,
   serverConfig: McpSSEServerConfig | McpHTTPServerConfig,
@@ -346,6 +443,11 @@ export function getServerKey(
  * state is guaranteed to 401 — the only way out is the user running
  * /mcp to authenticate.
  */
+  /**
+   * 中文：判断「探过这个 server，但手里没有任何凭据」——这种状态下发请求必然 401，
+   * 唯一的出路是让用户去 /mcp 走一遍授权。
+   * XAA server 例外：它们可以靠缓存的 id_token 静默换票，不能提前判死（英文注释有说明）。
+   */
 export function hasMcpDiscoveryButNoToken(
   serverName: string,
   serverConfig: McpSSEServerConfig | McpHTTPServerConfig,
@@ -354,6 +456,7 @@ export function hasMcpDiscoveryButNoToken(
   // access/refresh token — tokens() fires the xaaRefresh path. Skipping the
   // connection here would make that auto-auth branch unreachable after
   // invalidateCredentials('tokens') clears the stored tokens.
+    // 中文：XAA server 即使没有 access/refresh token 也能用 id_token 静默换票，所以不能算「没救」
   if (isXaaEnabled() && serverConfig.oauth?.xaa) {
     return false
   }
@@ -378,6 +481,13 @@ export function hasMcpDiscoveryButNoToken(
  * This fallback should rarely be needed - most servers either accept the compliant
  * approach or ignore unexpected headers.
  */
+  /**
+   * 中文：按 RFC 7009 撤销单个 token。
+   * 两种客户端认证方式（英文注释讲得很细）：公开客户端应当把 client_id 放在请求体里，
+   * 而不是用 Authorization 头（那是给资源拥有者用的）；但有些 AS 不合规，
+   * 所以拿到 401 时会退一步改用 Bearer 重试一次。
+   * 关键点：不能同时用两种认证方式（RFC 6749 §2.3.1），所以重试前要把 body 里的凭据删掉。
+   */
 async function revokeToken({
   serverName,
   endpoint,
@@ -408,6 +518,7 @@ async function revokeToken({
   // RFC 7009 §2.1 requires client auth per RFC 6749 §2.3. XAA always uses a
   // confidential client at the AS — strict ASes (Okta/Stytch) reject public-
   // client revocation of confidential-client tokens.
+    // 中文：XAA 在 AS 侧是机密客户端，严格 AS（Okta/Stytch）会拒绝「公开客户端」方式的撤销
   if (clientId && clientSecret) {
     if (authMethod === 'client_secret_post') {
       params.set('client_id', clientId)
@@ -432,6 +543,7 @@ async function revokeToken({
     logMCPDebug(serverName, `Successfully revoked ${tokenTypeHint}`)
   } catch (error: unknown) {
     // Fallback for non-RFC-7009-compliant servers that require Bearer auth
+    // 中文：为不合规的 AS 兜底：401 时改用 Bearer 重试一次（仅此一次）
     if (
       axios.isAxiosError(error) &&
       error.response?.status === 401 &&
@@ -443,6 +555,7 @@ async function revokeToken({
       )
       // RFC 6749 §2.3.1: must not send more than one auth method. The retry
       // switches to Bearer — clear any client creds from the body.
+      // 中文：RFC 6749 §2.3.1 禁止同时用多种认证方式——切到 Bearer 前要把 body 里的凭据清掉
       params.delete('client_id')
       params.delete('client_secret')
       await axios.post(endpoint, params, {
@@ -464,6 +577,12 @@ async function revokeToken({
  * then the access token. Revoking the refresh token prevents generation of new
  * access tokens and many servers implicitly invalidate associated access tokens.
  */
+  /**
+   * 中文：撤销某个 server 在 AS 上的 token，并清掉本地存储。
+   * 顺序：先 refresh_token（长效凭据，撤销它才能阻止继续签发新 access_token），再 access_token。
+   * 服务端撤销是 best-effort（失败也只记日志），但本地 token 一定会清——保证「用户点了清除就一定清掉」。
+   * preserveStepUpState：重新授权时保留「提权 scope + 发现信息」，避免下次再探一次。
+   */
 export async function revokeServerTokens(
   serverName: string,
   serverConfig: McpSSEServerConfig | McpHTTPServerConfig,
@@ -481,6 +600,7 @@ export async function revokeServerTokens(
     try {
       // For XAA (and any PRM-discovered auth), the AS is at a different host
       // than the MCP URL — use the persisted discoveryState if we have it.
+      // 中文：XAA / PRM 场景下 AS 和 MCP server 不是同一个主机，要用之前存下来的 AS URL
       const asUrl =
         tokenData.discoveryState?.authorizationServerUrl ?? serverConfig.url
       const metadata = await fetchAuthServerMetadata(
@@ -520,6 +640,7 @@ export async function revokeServerTokens(
             `Revoking tokens via ${revocationEndpointStr} (${authMethod})`,
           )
 
+          // 中文：先撤 refresh_token——它是长效凭据，撤销后就无法再签发新的 access_token
           // Revoke refresh token first (more important - prevents future access token generation)
           if (tokenData.refreshToken) {
             try {
@@ -543,6 +664,7 @@ export async function revokeServerTokens(
           }
 
           // Then revoke access token (may already be invalidated by refresh token revocation)
+          // 中文：再撤 access_token（很多 AS 在撤 refresh 时已经顺带失效了它，所以失败也无所谓）
           if (tokenData.accessToken) {
             try {
               await revokeToken({
@@ -572,12 +694,14 @@ export async function revokeServerTokens(
     logMCPDebug(serverName, 'No tokens to revoke')
   }
 
+    // 中文：无论服务端撤销成不成功，本地凭据一律清掉
   // Always clear local tokens, regardless of server-side revocation result.
   clearServerTokensFromLocalStorage(serverName, serverConfig)
 
   // When re-authenticating, preserve step-up auth state (scope + discovery)
   // so the next performMCPOAuthFlow can use cached scope instead of
   // re-probing. For "Clear Auth" (default), wipe everything.
+    // 中文：重新授权时保留 step-up 状态（scope + 发现信息）；「清除鉴权」则不保留
   if (
     preserveStepUpState &&
     tokenData &&
@@ -617,6 +741,9 @@ export async function revokeServerTokens(
   }
 }
 
+  /**
+   * 中文：只清本地存储的 token（不通知 AS）。
+   */
 export function clearServerTokensFromLocalStorage(
   serverName: string,
   serverConfig: McpSSEServerConfig | McpHTTPServerConfig,
@@ -638,6 +765,7 @@ type WWWAuthenticateParams = {
   resourceMetadataUrl?: URL
 }
 
+  // 中文：XAA 流程的四个阶段，用于失败时精确归因（埋点用）
 type XaaFailureStage =
   | 'idp_login'
   | 'discovery'
@@ -661,6 +789,14 @@ type XaaFailureStage =
  * No silent fallback: if `oauth.xaa` is set, XAA is the only path.
  * All errors are actionable — they tell the user what to run.
  */
+  /**
+   * 中文：★ XAA 授权（无浏览器）：一次 IdP 登录 → 换出 MCP 的 access_token。
+   * 步骤：① 从 settings.xaaIdp 读 IdP 配置 → ② 取 server 的 AS clientId/secret
+   *      → ③ 取（或登录拿）IdP 的 id_token → ④ OIDC 发现拿 IdP 的 token endpoint
+   *      → ⑤ performCrossAppAccess 做两段换票 → ⑥ 把 token 写进和普通 OAuth 相同的钥匙串槽位。
+   * 设计原则（英文注释强调）：不做静默回退——配了 oauth.xaa 就只走 XAA，
+   * 失败要给「你该跑什么命令」的可执行提示，不能悄悄退化成标准授权流程。
+   */
 async function performMCPXaaAuth(
   serverName: string,
   serverConfig: McpSSEServerConfig | McpHTTPServerConfig,
@@ -673,6 +809,7 @@ async function performMCPXaaAuth(
   }
 
   // IdP config comes from user-level settings, not per-server.
+  // 中文：IdP 的连接信息是全局配置（settings.xaaIdp），不是每个 server 配一份
   const idp = getXaaIdpSettings()
   if (!idp) {
     throw new Error(
@@ -687,6 +824,7 @@ async function performMCPXaaAuth(
     )
   }
 
+  // 中文：AS 的 clientSecret 存在钥匙串里（按 serverKey 分槽），不在配置文件里
   const clientConfig = getMcpClientConfig(serverName, serverConfig)
   const clientSecret = clientConfig?.clientSecret
   if (!clientSecret) {
@@ -714,11 +852,13 @@ async function performMCPXaaAuth(
 
   // IdP client secret lives in a separate keychain slot (keyed by IdP issuer),
   // NOT the AS secret — different trust domain. Optional: if absent, PKCE-only.
+  // 中文：IdP 的 clientSecret 存在另一个钥匙串槽位（按 issuer 分），与 AS 的 secret 分属不同信任域
   const idpClientSecret = getIdpClientSecret(idp.issuer)
 
   // Acquire id_token (cached or via one OIDC browser pop at the IdP).
   // Peek the cache first so we can report idTokenCacheHit in analytics before
   // acquireIdpIdToken potentially writes a fresh one.
+  // 中文：先看一眼缓存有没有命中，纯粹为了埋点能区分「这次是否真的弹了浏览器」
   const idTokenCacheHit = getCachedIdpIdToken(idp.issuer) !== undefined
 
   let failureStage: XaaFailureStage = 'idp_login'
@@ -740,6 +880,7 @@ async function performMCPXaaAuth(
     }
 
     // Discover the IdP's token endpoint for the RFC 8693 exchange.
+    // 中文：先记录阶段，失败时才能归因到 discovery / token_exchange / jwt_bearer 中的哪一步
     failureStage = 'discovery'
     const oidc = await discoverOidc(idp.issuer)
 
@@ -768,6 +909,7 @@ async function performMCPXaaAuth(
       // next attempt does a fresh IdP login. XaaTokenExchangeError carries
       // shouldClearIdToken so we key off OAuth semantics (4xx / invalid body
       // → clear; 5xx IdP outage → preserve) rather than substring matching.
+      // 中文：按 OAuth 语义决定是否清 id_token 缓存：4xx/响应结构不对 → 清；5xx（IdP 挂了）→ 保留
       if (e instanceof XaaTokenExchangeError) {
         if (e.shouldClearIdToken) {
           clearIdpIdToken(idp.issuer)
@@ -793,6 +935,7 @@ async function performMCPXaaAuth(
     // Save tokens via the same storage path as normal OAuth. We write directly
     // (instead of ClaudeAuthProvider.saveTokens) to avoid instantiating the
     // whole provider just to write the same keys.
+    // 中文：直接写存储而不是走 saveTokens，是为了省掉「只为写几个 key 就 new 一个 provider」的开销
     const storage = getSecureStorage()
     const existingData = storage.read() || {}
     const serverKey = getServerKey(serverName, serverConfig)
@@ -844,6 +987,15 @@ async function performMCPXaaAuth(
   }
 }
 
+  /**
+   * 中文：★ 标准 OAuth 授权主入口（有浏览器交互）。
+   * 入参 serverName / serverConfig / onAuthorizationUrl（把授权 URL 给 UI 兜底展示）/
+   *   abortSignal / options.skipBrowserOpen / options.onWaitingForCallback（远程环境下手动粘回调 URL）。
+   * 步骤：① 若配了 XAA 就走 XAA 分支并直接返回；② 读缓存的 step-up scope 与发现信息
+   *      → ③ 清掉旧凭据（保证重新注册客户端）→ ④ 挑回调端口、建 provider、拉元数据
+   *      → ⑤ 起本地回调服务器 + 打开浏览器 → ⑥ 收到 code 后用 SDK 完成换票 → ⑦ 存 token。
+   * 全程 5 分钟超时，且支持 abort（Esc 取消）。
+   */
 export async function performMCPOAuthFlow(
   serverName: string,
   serverConfig: McpSSEServerConfig | McpHTTPServerConfig,
@@ -868,6 +1020,7 @@ export async function performMCPOAuthFlow(
   //
   // Servers with `oauth.xaa` but CLAUDE_CODE_ENABLE_XAA unset hard-fail with
   // actionable copy rather than silently degrade to consent.
+  // 中文：配了 oauth.xaa 就只走 XAA——哪怕 XAA 没开也直接报错，绝不静默退化到标准授权
   if (serverConfig.oauth?.xaa) {
     if (!isXaaEnabled()) {
       throw new Error(
@@ -903,6 +1056,7 @@ export async function performMCPOAuthFlow(
   // Check for cached step-up scope and resource metadata URL before clearing
   // tokens. The transport-attached auth provider persists scope when it receives
   // a step-up 401, so we can use it here instead of making an extra probe request.
+  // 中文：清旧凭据之前先把 step-up scope 和发现信息读出来，下一步还要用
   const storage = getSecureStorage()
   const serverKey = getServerKey(serverName, serverConfig)
   const cachedEntry = storage.read()?.mcpOAuth?.[serverKey]
@@ -913,6 +1067,7 @@ export async function performMCPOAuthFlow(
   // Clear any existing stored credentials to ensure fresh client registration.
   // Note: this deletes the entire entry (including discoveryState/stepUpScope),
   // but we already read the cached values above.
+  // 中文：删掉整条记录，保证重新走 DCR 拿新的 client_id（避免用已失效的客户端信息）
   clearServerTokensFromLocalStorage(serverName, serverConfig)
 
   // Use cached step-up scope and resource metadata URL if available.
@@ -934,6 +1089,7 @@ export async function performMCPOAuthFlow(
     resourceMetadataUrl,
   }
 
+  // 中文：一次授权流程一个 id，便于把同一次尝试的多条埋点串起来
   const flowAttemptId = randomUUID()
 
   logEvent('tengu_mcp_oauth_flow_start', {
@@ -953,10 +1109,12 @@ export async function performMCPOAuthFlow(
 
   // Track whether we reached the token-exchange phase so the catch block can
   // attribute the failure reason correctly.
+  // 中文：标记「是否已经拿到授权码」——catch 里靠它区分是「登录阶段失败」还是「换票阶段失败」
   let authorizationCodeObtained = false
 
   try {
     // Use configured callback port for pre-configured OAuth, otherwise find an available port
+  // 中文：配了 callbackPort 就用固定的（有些 IdP 客户端预注册时写死了回调地址），否则随机挑一个
     const configuredCallbackPort = serverConfig.oauth?.callbackPort
     const port = configuredCallbackPort ?? (await findAvailablePort())
     const redirectUri = buildRedirectUri(port)
@@ -965,6 +1123,7 @@ export async function performMCPOAuthFlow(
       `Using redirect port: ${port}${configuredCallbackPort ? ' (from config)' : ''}`,
     )
 
+  // 中文：provider 是 SDK 与本地存储之间的桥梁（token 存取、client 信息、PKCE verifier 都在它身上）
     const provider = new ClaudeAuthProvider(
       serverName,
       serverConfig,
@@ -1026,6 +1185,7 @@ export async function performMCPOAuthFlow(
     }
 
     // Setup a server to receive the callback
+  // 中文：★ 核心：把「浏览器回调」这个事件包成一个 Promise，await 到授权码为止
     const authorizationCode = await new Promise<string>((resolve, reject) => {
       let resolved = false
       const resolveOnce = (code: string) => {
@@ -1039,6 +1199,7 @@ export async function performMCPOAuthFlow(
         reject(error)
       }
 
+    // 中文：支持用户按 Esc / 组件卸载时取消整个流程
       if (abortSignal) {
         abortHandler = () => {
           cleanup()
@@ -1053,6 +1214,7 @@ export async function performMCPOAuthFlow(
 
       // Allow manual callback URL paste for remote/browser-based environments
       // where localhost is not reachable from the user's browser.
+        // 中文：远程/浏览器环境里 localhost 可能不可达，允许用户把回调 URL 手动粘回来
       if (options?.onWaitingForCallback) {
         options.onWaitingForCallback((callbackUrl: string) => {
           try {
@@ -1096,6 +1258,7 @@ export async function performMCPOAuthFlow(
         })
       }
 
+      // 中文：本地回调服务器：只认 /callback，解析 code / state / error
       server = createServer((req, res) => {
         const parsedUrl = parse(req.url || '', true)
 
@@ -1107,6 +1270,7 @@ export async function performMCPOAuthFlow(
           const errorUri = parsedUrl.query.error_uri as string
 
           // Validate OAuth state to prevent CSRF attacks
+          // 中文：state 不匹配 = 可能是 CSRF，直接拒绝（OAuth 的标准防护）
           if (!error && state !== oauthState) {
             res.writeHead(400, { 'Content-Type': 'text/html' })
             res.end(
@@ -1120,6 +1284,7 @@ export async function performMCPOAuthFlow(
           if (error) {
             res.writeHead(200, { 'Content-Type': 'text/html' })
             // Sanitize error messages to prevent XSS
+          // 中文：错误信息来自外部，回显到 HTML 前必须过 xss() 转义，否则就是 XSS
             const sanitizedError = xss(String(error))
             const sanitizedErrorDescription = errorDescription
               ? xss(String(errorDescription))
@@ -1150,6 +1315,7 @@ export async function performMCPOAuthFlow(
         }
       })
 
+      // 中文：端口被占用是最常见的失败原因，单独给可执行的排查命令
       server.on('error', (err: NodeJS.ErrnoException) => {
         cleanup()
         if (err.code === 'EADDRINUSE') {
@@ -1168,6 +1334,7 @@ export async function performMCPOAuthFlow(
         }
       })
 
+      // 中文：★ 必须在 listen 成功之后才启动授权（开浏览器）——否则会先弹出一个注定失败的标签页
       server.listen(port, '127.0.0.1', async () => {
         try {
           logMCPDebug(serverName, `Starting SDK auth`)
@@ -1175,6 +1342,7 @@ export async function performMCPOAuthFlow(
 
           // First call to start the auth flow - should redirect
           // Pass the scope and resource_metadata from WWW-Authenticate header if available
+          // 中文：第一次调 sdkAuth 应当返回 REDIRECT（表示需要跳转浏览器）
           const result = await sdkAuth(provider, {
             serverUrl: serverConfig.url,
             scope: wwwAuthParams.scope,
@@ -1199,6 +1367,7 @@ export async function performMCPOAuthFlow(
       // component unmounts without aborting (e.g. parent intercepts Esc), we'd
       // rather let the process exit than stay alive for 5 minutes holding the
       // port. The abortSignal is the intended lifecycle management.
+      // 中文：unref 让回调服务器不吊住事件循环——否则 UI 卸载后进程可能还挂着 5 分钟
       server.unref()
 
       timeoutId = setTimeout(
@@ -1214,9 +1383,11 @@ export async function performMCPOAuthFlow(
     })
 
     authorizationCodeObtained = true
+    // 中文：走到这里说明授权码已到手，后面再出错就归类为「换票失败」
 
     // Now complete the auth flow with the received code
     logMCPDebug(serverName, `Completing auth flow with authorization code`)
+    // 中文：第二次调 sdkAuth，带 authorizationCode —— 这次才是真正的换票
     const result = await sdkAuth(provider, {
       serverUrl: serverConfig.url,
       authorizationCode,
@@ -1225,6 +1396,7 @@ export async function performMCPOAuthFlow(
 
     logMCPDebug(serverName, `Auth result: ${result}`)
 
+    // 中文：AUTHORIZED 表示换票成功且 token 已存好
     if (result === 'AUTHORIZED') {
       // Debug: Check if tokens were properly saved
       const savedTokens = await provider.tokens()
@@ -1262,6 +1434,7 @@ export async function performMCPOAuthFlow(
     // Determine failure reason for attribution telemetry. The try block covers
     // port acquisition, the callback server, the redirect flow, and token
     // exchange. Map known failure paths to stable reason codes.
+    // 中文：把已知失败路径映射成稳定原因码，便于归因分析（顺序很重要）
     let reason: MCPOAuthFlowErrorReason = 'unknown'
     let oauthErrorCode: string | undefined
     let httpStatus: number | undefined
@@ -1293,6 +1466,7 @@ export async function performMCPOAuthFlow(
     // sdkAuth uses native fetch and throws OAuthError subclasses (InvalidGrantError,
     // ServerError, InvalidClientError, etc.) via parseErrorResponse. Extract the
     // OAuth error code directly from the SDK error instance.
+    // 中文：SDK 抛的是 OAuthError 子类，直接读 errorCode 比解析字符串可靠
     if (error instanceof OAuthError) {
       oauthErrorCode = error.errorCode
       // SDK does not attach HTTP status as a property, but the fallback ServerError
@@ -1351,6 +1525,13 @@ export async function performMCPOAuthFlow(
  * With this flag set, tokens() omits refresh_token so the SDK falls through
  * to the PKCE flow. See github.com/anthropics/claude-code/issues/28258.
  */
+  /**
+   * 中文：包装 fetch 以检测「403 + insufficient_scope」（需要更高权限）。
+   * 为什么必须在这里拦（英文注释给了完整链路）：不拦的话 SDK 会先尝试 refresh——但 RFC 6749 §6
+   * 明确禁止通过 refresh 提升 scope，于是刷出来还是同样的 token，重试又 403，最后报一个
+   * 莫名其妙的错。这里提前打个标记，让后面的 tokens() 故意不返回 refresh_token，
+   * 迫使 SDK 跳过刷新、直接走新的 PKCE 授权（也就是「step-up」）。
+   */
 export function wrapFetchWithStepUpDetection(
   baseFetch: FetchLike,
   provider: ClaudeAuthProvider,
@@ -1365,6 +1546,7 @@ export function wrapFetchWithStepUpDetection(
         const match = wwwAuth.match(/scope=(?:"([^"]+)"|([^\s,]+))/)
         const scope = match?.[1] ?? match?.[2]
         if (scope) {
+        // 中文：同时兼容带引号和不带引号的 scope 值（RFC 6750 §3 两种都允许）
           provider.markStepUpPending(scope)
         }
       }
@@ -1373,6 +1555,16 @@ export function wrapFetchWithStepUpDetection(
   }
 }
 
+  /**
+   * 中文：★ ClaudeAuthProvider —— 实现 MCP SDK 的 OAuthClientProvider 接口，
+   * 是「SDK 需要什么」与「我们怎么存」之间的适配器。
+   * SDK 会在这些时机回调它：state()（生成防 CSRF 的 state）、clientInformation()（取 client_id）、
+   * saveClientInformation()（DCR 之后存 client）、tokens()（取当前 token、必要时刷新）、
+   * saveTokens()（存新 token）、redirectToAuthorization()（打开浏览器）、
+   * codeVerifier()/saveCodeVerifier()（PKCE）、invalidateCredentials()（失效）、
+   * discoveryState()/saveDiscoveryState()（发现结果缓存）。
+   * 所有持久化的东西都放在钥匙串（secureStorage）里，按 getServerKey() 分槽。
+   */
 export class ClaudeAuthProvider implements OAuthClientProvider {
   private serverName: string
   private serverConfig: McpSSEServerConfig | McpHTTPServerConfig
@@ -1406,6 +1598,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     this.skipBrowserOpen = skipBrowserOpen ?? false
   }
 
+  // 中文：getter——调用方写 provider.redirectUrl（不带括号），≈ Java 的 getRedirectUrl()
   get redirectUrl(): string {
     return this.redirectUri
   }
@@ -1442,6 +1635,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
    * client_id instead of performing Dynamic Client Registration.
    * Override via MCP_OAUTH_CLIENT_METADATA_URL env var (e.g. for testing, FedStart).
    */
+  // 中文：CIMD（SEP-991）：用一个 URL 当 client_id，省掉动态注册；可用环境变量覆盖
   get clientMetadataUrl(): string | undefined {
     const override = process.env.MCP_OAUTH_CLIENT_METADATA_URL
     if (override) {
@@ -1470,6 +1664,9 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     logMCPDebug(this.serverName, `Marked step-up pending: ${scope}`)
   }
 
+  /**
+   * 中文：生成（并记住）OAuth 的 state，用于回调时校验，防 CSRF。
+   */
   async state(): Promise<string> {
     // Generate state if not already generated for this instance
     if (!this._state) {
@@ -1479,12 +1676,17 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     return this._state
   }
 
+  /**
+   * 中文：取 client_id / client_secret。两级来源：先查钥匙串里存过的（DCR 或上次授权留下的），
+   * 再退到配置里手写的 clientId；都没有就返回 undefined，让 SDK 去走动态注册（DCR）。
+   */
   async clientInformation(): Promise<OAuthClientInformation | undefined> {
     const storage = getSecureStorage()
     const data = storage.read()
     const serverKey = getServerKey(this.serverName, this.serverConfig)
 
     // Check session credentials first (from DCR or previous auth)
+    // 中文：优先用钥匙串里已注册的客户端信息
     const storedInfo = data?.mcpOAuth?.[serverKey]
     if (storedInfo?.clientId) {
       logMCPDebug(this.serverName, `Found client info`)
@@ -1494,6 +1696,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
       }
     }
 
+    // 中文：退而求其次：配置里预置的 clientId（secret 从钥匙串的 clientConfig 槽位取）
     // Fallback: pre-configured client ID from server config
     const configClientId = this.serverConfig.oauth?.clientId
     if (configClientId) {
@@ -1510,6 +1713,9 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     return undefined
   }
 
+  /**
+   * 中文：DCR（动态客户端注册）成功后存下 client_id / client_secret。
+   */
   async saveClientInformation(
     clientInformation: OAuthClientInformationFull,
   ): Promise<void> {
@@ -1537,6 +1743,16 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     storage.update(updatedData)
   }
 
+  /**
+   * 中文：★ 取当前 token（SDK 每次发请求前都会调它）。
+   * 三条路径：① XAA 静默换票（有缓存 id_token 且没有 refresh_token 时）；
+   * ② 过期/即将过期（5 分钟内）且有 refresh_token → 主动刷新（省掉「先失败再刷」的延迟）；
+   * ③ 其余情况直接返回现存的 token。
+   * 性能注意（英文注释里有实测数据）：这里绝对不能清钥匙串缓存——SDK 每次请求都调它，
+   * 清缓存会导致每秒几十次同步 spawn `security` 命令，曾占到 7.2% 的 CPU。
+   * 并发保护：用 _refreshInProgress 存「在飞的刷新 Promise」，多个线程复用同一个，不重复刷新。
+   * step-up：若检测到需要提权，则在返回值里故意不带 refresh_token，逼 SDK 走新的授权。
+   */
   async tokens(): Promise<OAuthTokens | undefined> {
     // Cross-process token changes (another CC instance refreshed or invalidated)
     // are picked up via the keychain cache TTL (see macOsKeychainStorage.ts).
@@ -1582,6 +1798,8 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     // isn't cached (or settings.xaaIdp is gone) → we fall through to the
     // existing needs-auth path → user runs `xaa login`.
     //
+    // 中文：XAA 静默换票的触发条件总结：开了 XAA、本 server 配了 xaa、没有 refresh_token、
+    //       且 access_token 不存在或 5 分钟内过期
     if (
       isXaaEnabled() &&
       this.serverConfig.oauth?.xaa &&
@@ -1614,6 +1832,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
       // !tokenData → undefined → 401 → needs-auth; expired → undefined → same.
     }
 
+    // 中文：完全没有凭据 → 返回 undefined，SDK 会触发 401 → 上层显示 needs-auth
     if (!tokenData) {
       logMCPDebug(this.serverName, `No token data found`)
       return undefined
@@ -1625,6 +1844,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     // Step-up check: if a 403 insufficient_scope was detected and the current
     // token doesn't have the requested scope, omit refresh_token below so the
     // SDK skips refresh and falls through to the PKCE flow.
+    // 中文：step-up 判定：请求的 scope 里有当前 token 没有的 → 需要提权
     const currentScopes = tokenData.scope?.split(' ') ?? []
     const needsStepUp =
       this._pendingStepUpScope !== undefined &&
@@ -1637,6 +1857,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     }
 
     // If token is expired and we don't have a refresh token, return undefined
+    // 中文：已过期且没有 refresh_token → 没法救，只能返回 undefined 走重新授权
     if (expiresIn <= 0 && !tokenData.refreshToken) {
       logMCPDebug(this.serverName, `Token expired without refresh token`)
       return undefined
@@ -1647,6 +1868,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     // While MCP servers should return 401 for expired tokens (which triggers SDK-level refresh), proactively refreshing
     // before expiry provides a smoother user experience.
     // Skip when step-up is pending — refreshing can't elevate scope (RFC 6749 §6).
+    // 中文：5 分钟内过期就提前刷新（用户体验优化）；有 step-up 待处理时不刷（刷新无法提权）
     if (expiresIn <= 300 && tokenData.refreshToken && !needsStepUp) {
       // Reuse existing refresh promise if one is in progress to prevent concurrent refreshes
       if (!this._refreshInProgress) {
@@ -1688,6 +1910,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     const tokens = {
       access_token: tokenData.accessToken,
       refresh_token: needsStepUp ? undefined : tokenData.refreshToken,
+      // 中文：★ step-up 时故意不给 refresh_token —— 断掉 SDK 的刷新路径，逼它走新的 PKCE 授权
       expires_in: expiresIn,
       scope: tokenData.scope,
       token_type: 'Bearer',
@@ -1701,6 +1924,9 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     return tokens
   }
 
+  /**
+   * 中文：把新 token 写进钥匙串（按 serverKey 存）。
+   */
   async saveTokens(tokens: OAuthTokens): Promise<void> {
     this._pendingStepUpScope = undefined
     const storage = getSecureStorage()
@@ -1748,6 +1974,13 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
    * but this is the shape CLAUDE.md flags under "Token/auth caching across
    * process boundaries". Mirror refreshAuthorization()'s lockfile pattern.
    */
+  /**
+   * 中文：XAA 静默刷新：用缓存的 id_token 直接走四段换票，全程无浏览器。
+   * 返回 undefined 表示「id_token 没了」，调用方据此判定需要用户重新登录（会变成 401 → needs-auth）。
+   * 换票失败时若异常要求清缓存，就把 id_token 清掉，下次好走一次全新的 IdP 登录。
+   * 已知不足（英文 TODO 承认）：_refreshInProgress 只能挡住单进程内的并发，
+   * 多开的 Claude Code 仍会各自跑一遍完整换票链（待 GA 前补跨进程锁）。
+   */
   private async xaaRefresh(): Promise<OAuthTokens | undefined> {
     const idp = getXaaIdpSettings()
     if (!idp) return undefined // config was removed mid-session
@@ -1789,6 +2022,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     }
 
     try {
+    // 中文：关键四段换票（PRM 发现 → AS 发现 → IdP 令牌交换 → AS JWT Bearer），见 xaa.ts
       const tokens = await performCrossAppAccess(
         this.serverConfig.url,
         {
@@ -1849,6 +2083,12 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     }
   }
 
+  /**
+   * 中文：SDK 要求跳转浏览器时调用。
+   * 三件事：① 记下授权 URL 与 scope（scope 之后换票要用）；
+   * ② 若是「提权」场景（非正常授权流程），把 scope 持久化下来，下次不用再探测；
+   * ③ 校验 URL scheme、回调 UI、最后开浏览器。
+   */
   async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
     // Store the authorization URL
     this._authorizationUrl = authorizationUrl.toString()
@@ -1887,6 +2127,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     // so the next performMCPOAuthFlow can use it without an extra probe request.
     // Guard with !handleRedirection to avoid persisting during normal auth flows
     // (where the scope may come from metadata scopes_supported rather than a 401).
+    // 中文：只在「传输层附着的 provider」（handleRedirection=false）收到 step-up 401 时才持久化 scope
     if (this._scopes && !this.handleRedirection) {
       const storage = getSecureStorage()
       const existingData = storage.read() || {}
@@ -1899,6 +2140,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
       }
     }
 
+    // 中文：handleRedirection=false 时本 provider 不负责开浏览器（由外层流程处理），直接返回
     if (!this.handleRedirection) {
       logMCPDebug(
         this.serverName,
@@ -1909,6 +2151,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
 
     // Validate URL scheme for security
     const urlString = authorizationUrl.toString()
+    // 中文：安全校验——只允许 http/https，挡掉 javascript: 之类的 scheme
     if (!urlString.startsWith('http://') && !urlString.startsWith('https://')) {
       throw new Error(
         'Invalid authorization URL: must use http:// or https:// scheme',
@@ -1921,6 +2164,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
 
     // Notify the UI about the authorization URL BEFORE opening the browser,
     // so users can see the URL as a fallback if the browser fails to open
+    // 中文：先把 URL 交给 UI，再开浏览器：万一浏览器打不开，用户还能手动复制这个链接
     if (this.onAuthorizationUrlCallback) {
       this.onAuthorizationUrlCallback(urlString)
     }
@@ -1957,6 +2201,10 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     return this._codeVerifier
   }
 
+  /**
+   * 中文：按范围失效凭据：all（整条删）/ client（只删客户端信息）/ tokens（清空 token）/
+   * verifier（PKCE）/ discovery（发现信息）。
+   */
   async invalidateCredentials(
     scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery',
   ): Promise<void> {
@@ -1994,6 +2242,9 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     logMCPDebug(this.serverName, `Invalidated credentials (scope: ${scope})`)
   }
 
+  /**
+   * 中文：保存发现（discovery）结果。
+   */
   async saveDiscoveryState(state: OAuthDiscoveryState): Promise<void> {
     const storage = getSecureStorage()
     const existingData = storage.read() || {}
@@ -2013,6 +2264,10 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     // the credential store (#30337). The SDK re-fetches missing metadata
     // with one HTTP GET on the next auth — see node_modules/.../auth.js
     // `cachedState.authorizationServerMetadata ?? await discover...`.
+    // 中文：★ 只存两个 URL，绝不存完整 metadata：macOS 钥匙串走 `security -i`，
+    //       stdin 单行上限 4096 字节（十六进制编码后约 2013 字节 JSON），
+    //       两个 server 存完整 metadata 就会溢出、把整个凭据库写坏（issue #30337）。
+    //       SDK 缺 metadata 时会自己发一次 GET 重新发现，代价可接受。
     const updatedData: SecureStorageData = {
       ...existingData,
       mcpOAuth: {
@@ -2034,6 +2289,9 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     storage.update(updatedData)
   }
 
+  /**
+   * 中文：取发现结果。优先用缓存的两个 URL；其次若配置里给了 authServerMetadataUrl 就去拉一次。
+   */
   async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
     const storage = getSecureStorage()
     const data = storage.read()
@@ -2087,6 +2345,12 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     return undefined
   }
 
+  /**
+   * 中文：★ 刷新 token（带跨进程文件锁）。
+   * 为什么要加锁：多个 Claude Code 进程可能同时发现 token 快过期了，各自去刷会导致
+   * refresh_token 轮换冲突（一个刷出来的新 token 会让另一个手里的旧 refresh_token 失效）。
+   * 拿到锁之后的第一个动作是「重新读一次存储」——别的进程可能已经刷好了，那就直接用它的结果。
+   */
   async refreshAuthorization(
     refreshToken: string,
   ): Promise<OAuthTokens | undefined> {
@@ -2094,9 +2358,11 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     const claudeDir = getClaudeConfigHomeDir()
     await mkdir(claudeDir, { recursive: true })
     const sanitizedKey = serverKey.replace(/[^a-zA-Z0-9]/g, '_')
+    // 中文：锁文件名要过滤掉特殊字符（serverKey 里含 | 等）
     const lockfilePath = join(claudeDir, `mcp-refresh-${sanitizedKey}.lock`)
 
     let release: (() => Promise<void>) | undefined
+    // 中文：ELOCKED（别人持锁）就随机退避 1~2 秒后重试，最多 5 次
     for (let retry = 0; retry < MAX_LOCK_RETRIES; retry++) {
       try {
         logMCPDebug(
@@ -2135,6 +2401,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
       )
     }
 
+    // 中文：拿到锁后先重读——别的进程可能已经刷好了；拿不到锁也继续（降级为不加锁刷新）
     try {
       // Re-read tokens after acquiring lock — another process may have refreshed
       clearKeychainCache()
@@ -2174,6 +2441,12 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
     }
   }
 
+  /**
+   * 中文：真正执行刷新，最多 3 次尝试（超时/5xx/429 等瞬时错误指数退避重试）。
+   * 元数据三级缓存：内存 → 持久化的发现 URL（重新发现一次）→ 完整 RFC 9728 发现。
+   * invalid_grant 的处理是重点：它意味着 refresh_token 失效，但仍要先确认
+   * 「是不是别的进程已经刷好了」——是就用它的，否则清空本地 token 走重新授权。
+   */
   private async _doRefresh(
     refreshToken: string,
   ): Promise<OAuthTokens | undefined> {
@@ -2207,6 +2480,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
       )
     }
 
+    // 中文：最多 3 次：1s、2s、4s 退避
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
         logMCPDebug(this.serverName, `Starting token refresh`)
@@ -2219,6 +2493,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
         // 2. Persisted discovery state from initial auth (cross-session) —
         //    avoids re-running RFC 9728 discovery on every refresh.
         // 3. Full RFC 9728 → RFC 8414 re-discovery via fetchAuthServerMetadata.
+    // 中文：元数据是静态的，能复用就复用——省掉每次刷新都跑一遍 RFC 9728 发现
         let metadata = this._metadata
         if (!metadata) {
           const cached = await this.discoveryState()
@@ -2255,6 +2530,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
         // Cache for future refreshes
         this._metadata = metadata
 
+    // 中文：没有 client 信息就没法刷新（DCR 还没做过 / 被清了）
         const clientInfo = await this.clientInformation()
         if (!clientInfo) {
           logMCPDebug(this.serverName, `No client information available`)
@@ -2286,6 +2562,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
       } catch (error) {
         // Invalid grant means the refresh token itself is invalid/revoked/expired.
         // But another process may have already refreshed successfully — check first.
+      // 中文：invalid_grant = refresh_token 被吊销/过期；但要先看看是不是别的进程已经成功了
         if (error instanceof InvalidGrantError) {
           logMCPDebug(
             this.serverName,
@@ -2325,6 +2602,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
         }
 
         // Retry on timeouts or transient server errors
+    // 中文：只对「超时 / 5xx / 503 / 429」这类瞬时错误重试，其它错误直接放弃
         const isTimeoutError =
           error instanceof Error &&
           /timeout|timed out|etimedout|econnreset/i.test(error.message)
@@ -2346,6 +2624,7 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
           return undefined
         }
 
+    // 中文：指数退避：1s → 2s → 4s
         const delayMs = 1000 * Math.pow(2, attempt - 1) // 1s, 2s, 4s
         logMCPDebug(
           this.serverName,
@@ -2359,6 +2638,10 @@ export class ClaudeAuthProvider implements OAuthClientProvider {
   }
 }
 
+  /**
+   * 中文：交互式读取 OAuth client secret（命令行下提示用户输入，输入不回显）。
+   * 优先读环境变量 MCP_CLIENT_SECRET；没有 TTY 时直接报错。
+   */
 export async function readClientSecret(): Promise<string> {
   const envSecret = process.env.MCP_CLIENT_SECRET
   if (envSecret) {
@@ -2396,6 +2679,7 @@ export async function readClientSecret(): Promise<string> {
   })
 }
 
+  // 中文：把 AS 的 client secret 存进钥匙串（单独的 mcpOAuthClientConfig 槽位）
 export function saveMcpClientSecret(
   serverName: string,
   serverConfig: McpSSEServerConfig | McpHTTPServerConfig,
@@ -2413,6 +2697,7 @@ export function saveMcpClientSecret(
   })
 }
 
+  // 中文：清除某个 server 的 client 配置
 export function clearMcpClientConfig(
   serverName: string,
   serverConfig: McpSSEServerConfig | McpHTTPServerConfig,
@@ -2427,6 +2712,7 @@ export function clearMcpClientConfig(
   }
 }
 
+  // 中文：读取某个 server 的 client 配置（主要是 clientSecret）
 export function getMcpClientConfig(
   serverName: string,
   serverConfig: McpSSEServerConfig | McpHTTPServerConfig,
@@ -2442,6 +2728,11 @@ export function getMcpClientConfig(
  * The metadata can be either OAuthMetadata or OpenIdProviderDiscoveryMetadata,
  * and different providers use different fields for scope information.
  */
+  /**
+   * 中文：从 AS 元数据里安全地取 scope。
+   * 为什么要试三个字段（英文注释说明了）：各家实现的字段名不统一——有非标的 scope、default_scope，
+   * 也有标准的 scopes_supported（数组）。
+   */
 function getScopeFromMetadata(
   metadata: AuthorizationServerMetadata | undefined,
 ): string | undefined {

@@ -1,36 +1,120 @@
+/**
+ * ============================================================================
+ *  【文件总览】src/tools/TaskStopTool/UI.tsx
+ *              —— TaskStop 工具在终端里显示什么（React 渲染层）
+ * ============================================================================
+ *
+ *  【一句话定位】
+ *  本文件决定"停掉一个任务"这件事在终端上怎么显示：显示被停掉的那条命令 + " · stopped"。
+ *
+ *  【本文件包含什么】
+ *   1. renderToolUseMessage()      调用发起时显示什么（这里返回空串 = 什么都不显示）
+ *   2. truncateCommand()           把命令截断到"最多 2 行、最多 160 个字符"
+ *   3. renderToolResultMessage()   调用结束后显示什么
+ *
+ *  【为什么要截断命令？】
+ *  终端宽度有限（通常 80~120 列）。后台任务的命令可能是一条超长的 shell 命令，
+ *  不截断会把终端界面撑乱、把其它内容挤出去。所以定了两个上限：行数和字符宽度。
+ *  截断后补一个省略号 '…'，让用户知道"后面还有"。
+ *
+ * ---------------------------------------------------------------------------
+ *  【TS 语法速查】（.tsx 特有，Java 工程师最需要补的一块）
+ * ---------------------------------------------------------------------------
+ *  - `.tsx` 后缀 = 允许直接写 **JSX**（长得像 HTML 的标签）。
+ *    它不是 HTML，而是 React 元素：`<Text>{command}</Text>` ≈ 构造一个组件节点。
+ *    属性名用驼峰（`dimColor`），不是 HTML 的横杠写法。
+ *  - `{expr}` 是 JSX 里的表达式插值 ≈ JSP 的 ${}。
+ *  - `React.ReactNode` 返回类型：可以是 JSX 元素、字符串、null 的联合类型。
+ *    返回 '' 或 null 都表示"什么都不渲染"。
+ *  - `command.split('\n')`：按换行切成数组（≈ Java 的 String.split）。
+ *  - `.slice(0, n)`：取前 n 个（≈ Java 的 subList(0, n)）。
+ *  - `stringWidth(s)`：算字符串的**显示宽度**。
+ *    ⚠️ 为什么不能直接用 s.length：中文/emoji 占两列宽，length 只数字符数。
+ *    终端排版必须按显示宽度算，否则会串行 —— 这是终端 UI 的经典坑。
+ *  - `const MAX_X = 2` 大写下划线命名的模块级常量 ≈ `private static final int`。
+ *  - `const` vs `let`：const = 不可重新赋值（≈ final），let = 可重新赋值。
+ *    注意 const 只锁"变量指向"，不锁对象内容（对象里的字段照样能改）。
+ *  - 文件末尾那行 `//# sourceMappingURL=...` 是 sourcemap 数据，**不要动它**。
+ */
 import React from 'react';
 import { MessageResponse } from '../../components/MessageResponse.js';
 import { stringWidth } from '../../ink/stringWidth.js';
 import { Text } from '../../ink.js';
 import { truncateToWidthNoEllipsis } from '../../utils/format.js';
 import type { Output } from './TaskStopTool.js';
+/**
+ * 工具调用**发起时**显示什么。
+ *
+ * @returns 空串 —— 意思是"这一条不用在终端上显示"。
+ *          为什么：停止任务是一个瞬时动作，发起时没什么可说的，
+ *          等结果出来（下面那个函数）再一起显示就够了。
+ *          返回 '' 而不是 null，是为了满足框架的 ReactNode 类型要求。
+ */
 export function renderToolUseMessage(): React.ReactNode {
   return '';
 }
+// 命令展示的两个上限：最多 2 行、最多 160 个显示宽度。
+// 目的是防止一条超长 shell 命令把终端界面撑乱。
 const MAX_COMMAND_DISPLAY_LINES = 2;
 const MAX_COMMAND_DISPLAY_CHARS = 160;
+/**
+ * 把一条（可能很长的）命令截断成适合终端显示的长度。
+ *
+ * 为什么需要：后台任务的命令可能是几百字符的 shell 管道，不截断会把界面挤坏。
+ *
+ * @param command 原始命令文本。
+ * @returns 截断后的文本（最多 2 行、最多 160 显示宽度，首尾无空白）。
+ *
+ * 关键步骤：
+ *   ① 超过 2 行就只保留前 2 行（多余的整行丢掉）
+ *   ② 还超过 160 个显示宽度就按宽度截断
+ *      —— 注意用 stringWidth 而不是 length：中文和 emoji 占两列宽
+ *   ③ trim 掉首尾空白后返回
+ */
 function truncateCommand(command: string): string {
   const lines = command.split('\n');
   let truncated = command;
+  // 先按行数截断：只留前两行。
   if (lines.length > MAX_COMMAND_DISPLAY_LINES) {
     truncated = lines.slice(0, MAX_COMMAND_DISPLAY_LINES).join('\n');
   }
+  // 再按**显示宽度**截断。必须 stringWidth(...) 而不是 .length：
+  // 中文、emoji 在终端里占两列，按字符数算会导致实际宽度超标、界面串行。
   if (stringWidth(truncated) > MAX_COMMAND_DISPLAY_CHARS) {
     truncated = truncateToWidthNoEllipsis(truncated, MAX_COMMAND_DISPLAY_CHARS);
   }
   return truncated.trim();
 }
+/**
+ * 工具调用**结束后**显示什么。
+ *
+ * @param output 工具返回值（含被停掉的 command）。
+ * @param _progressMessagesForMessage 进度消息，本工具不用（下划线前缀 = 故意忽略）。
+ * @param verbose 是否详细模式：**是的话显示完整命令，否则显示截断版**。
+ * @returns React 节点。
+ *
+ * 关键步骤：
+ *   ① 内部版本不显示（直接返回 null）
+ *   ② 按 verbose 决定显示完整命令还是截断版
+ *   ③ 如果命令被截断过，补一个 '…' 提示"后面还有"，再拼上 ' · stopped'
+ */
 export function renderToolResultMessage(output: Output, _progressMessagesForMessage: unknown[], {
   verbose
 }: {
   verbose: boolean;
 }): React.ReactNode {
+  // 内部版本（'ant'）不渲染这个结果 —— 不同发行渠道的展示差异。
+  // 注意这个比较恒为 false（'external' === 'ant'），是构建时替换留下的痕迹。
   if ("external" === 'ant') {
     return null;
   }
+  // `?? ''` 兜底：command 是可选字段，老 transcript 里可能没有（见 TaskStopTool.ts 的注释）。
   const rawCommand = output.command ?? '';
+  // verbose（详细模式）下显示完整命令，否则截断 —— 把"看全不全"的选择权交给用户。
   const command = verbose ? rawCommand : truncateCommand(rawCommand);
+  // 只有真的截断过才加省略号 '…'：没截断却显示省略号会误导用户以为内容被砍了。
   const suffix = command !== rawCommand ? '… · stopped' : ' · stopped';
+  // JSX：把命令和后缀拼成一行文本节点。{command}{suffix} 两个插值会顺序渲染。
   return <MessageResponse>
       <Text>
         {command}

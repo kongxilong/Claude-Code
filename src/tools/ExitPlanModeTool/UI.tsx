@@ -11,9 +11,141 @@ import { getDisplayPath } from '../../utils/file.js';
 import { getPlan } from '../../utils/plans.js';
 import type { ThemeName } from '../../utils/theme.js';
 import type { Output } from './ExitPlanModeV2Tool.js';
+/**
+ * ============================================================================
+ *  【文件总览】src/tools/ExitPlanModeTool/UI.tsx
+ * ============================================================================
+ *
+ *  一句话定位：
+ *  「退出 plan mode」这个工具在**终端里长什么样**的渲染代码。
+ *  纯展示层，不含业务逻辑。
+ *
+ *  ⚠️ 同 EnterPlanModeTool/UI.tsx：这个文件是编译产物的内联形式
+ *  （末尾挂着一长串 base64 的 sourceMappingURL），缩进和换行都不是手写风格。
+ *  读它是为了搞清楚终端上显示什么，不是学代码风格。
+ *
+ *  ---------------------------------------------------------------------------
+ *  【在架构中的位置】
+ *  ---------------------------------------------------------------------------
+ *      ExitPlanModeV2Tool.ts
+ *        ├─ renderToolUseMessage          ← ★ 本文件：刚发起调用时（什么都不显示）
+ *        ├─ renderToolResultMessage       ← ★ 本文件：审批完成后（三种样子）
+ *        └─ renderToolUseRejectedMessage  ← ★ 本文件：用户点了"拒绝"
+ *              ↓ 返回 React 元素树
+ *      Ink 渲染器把元素树画到终端上
+ *
+ *  ---------------------------------------------------------------------------
+ *  【本文件包含什么】
+ *  ---------------------------------------------------------------------------
+ *   1. renderToolUseMessage()          返回 null
+ *   2. renderToolResultMessage()       ★ 三种分支：
+ *                                        空方案 → "● Exited plan mode"
+ *                                        等负责人批 → "● Plan submitted for team lead approval"
+ *                                        正常     → "● User approved Claude's plan" + 渲染方案全文
+ *   3. renderToolUseRejectedMessage()  方案被拒时，把方案原文兜底显示出来
+ *
+ *  ---------------------------------------------------------------------------
+ *  【TS / JSX 语法速查】Java 工程师视角
+ *  ---------------------------------------------------------------------------
+ *  - 扩展名 `.tsx`：允许写 **JSX**（在 JS 里直接写标签）。
+ *    ≈ Java 没有对应物；最接近的想象是"用 Java 语法直接写组件树"。
+ *    ⚠️ 这里的 <Box>/<Text> **不是 HTML 标签**，而是 Ink 库（../../ink.js）的组件。
+ *       Ink = "命令行版的 React"，把组件树渲染成终端字符而不是浏览器 DOM：
+ *         <Box>  ≈ div，支持 flex 布局（flexDirection / paddingLeft 等）
+ *         <Text> ≈ span，支持 color / dimColor / bold 等文字样式
+ *
+ *  - `const { plan, filePath } = output;`
+ *    解构赋值：从对象里一次性抽出几个字段当局部变量。
+ *    ≈ Java 21+ 的记录模式匹配，但 TS 里是日常操作。
+ *
+ *  - `<Text>{plan}</Text>` 花括号 = "切回 JS 世界"，里面是表达式。
+ *    ≈ JSP/Thymeleaf 的 ${}。
+ *    `marginTop={1}` 花括号里是数字 1；若写 `marginTop="1"` 就是字符串。
+ *
+ *  - `{filePath && <Text dimColor>Plan saved to: ...</Text>}`
+ *    ★ 这是 JS 里非常常见但 Java 同学容易看懵的写法，务必看懂：
+ *      `a && b` 的求值规则是——a 为假就直接返回 a，a 为真才返回 b。
+ *      所以 `filePath && <Text/>` 的效果是：
+ *        filePath 有值（非空串）→ 渲染这个 <Text>
+ *        filePath 为空        → 什么都不渲染
+ *      ≈ Java 的三元 `filePath != null ? renderText() : null`，只是简写。
+ *      ⚠️ 和 Java 的 `&&` 只能返回 boolean 不同，JS 的 && 返回的是**操作数本身**。
+ *
+ *  - `{output.worktreeBranch ? <> ... </> : null}`（同类写法）
+ *    `<>...</>` 是 **Fragment（片段）**：几个并列元素要包在一起但不想多套一层 Box。
+ *    ≈ Java 里没有，想象成一个"透明的容器"。
+ *
+ *  - `??` 空值合并：`plan ?? getPlan() ?? 'No plan found'`
+ *    可以**串联**：从左往右，遇到第一个不是 null/undefined 的就停下。
+ *    ≈ Java 的 `Optional.ofNullable(plan).orElse(...)`，但写法轻得多。
+ *    ⚠️ 和 `||` 的区别：`??` 不会把空串 '' 和 0 跳过。
+ *
+ *  - `!plan || plan.trim() === ''`
+ *    这里用 `||` 是**故意的**：既要把 null/undefined 算作"空"，
+ *    也要把纯空白字符串算作"空"。用 `??` 就漏掉后者了。
+ *
+ *  - 函数**参数位置的解构**：
+ *        renderToolResultMessage(output, _progressMessages, { theme: _theme }: { theme: ThemeName })
+ *    第二个参数直接把 `{ theme }` 抽出来，并且就地声明它的类型。
+ *    ≈ Java 21+ 的记录模式匹配用在方法签名上。
+ *
+ *  - `plan?: string`  可选属性（等价于 `string | undefined`）。
+ *    ⚠️ 与 `.nullable()` 的 null 不是一回事：
+ *       undefined = 这个键没写；null = 写了但值是空。Java 只有 null 一种。
+ *
+ *  - `'`  这是 XML/HTML **实体**（entity），表示撇号 '。
+ *    本文件下面那句 `<Text> User approved Claude's plan</Text>` 就是它。
+ *    为什么不直接写 Claude's？因为 JSX 里单引号容易和属性引号/解析规则冲突，
+ *    用实体最保险。≈ Java 字符串里写 \' 做转义。
+ *    （同类的还有 & < > "）
+ *
+ *  - `_theme`、`_progressMessagesForMessage` 下划线前缀
+ *    = "这参数我不用，但签名必须对上"。TS 的 noUnusedParameters 会放过它们。
+ */
+/**
+ * 模型刚发起调用时显示什么。
+ *
+ * 返回 null —— **故意什么都不显示**，和 EnterPlanModeTool 同样的理由：
+ * "退出 plan mode"没有中间态值得展示，结果要么成功（走 renderToolResultMessage）
+ * 要么被拒（走 renderToolUseRejectedMessage）。
+ * 打个转瞬即逝的"正在退出…"只会让界面闪烁。
+ */
 export function renderToolUseMessage(): React.ReactNode {
   return null;
 }
+/**
+ * ★ 审批完成后在终端上显示什么。本文件的核心函数。
+ *
+ * 三种分支（和 ExitPlanModeV2Tool.call() 的三条执行路径一一对应）：
+ *
+ *   ① 空方案（plan 为 null / 纯空白）
+ *        显示：● Exited plan mode
+ *        就一行，干净利落。因为压根没有方案可展示。
+ *
+ *   ② 子 Agent 在等负责人批示（awaitingLeaderApproval）
+ *        显示：● Plan submitted for team lead approval
+ *              Plan file: xxx
+ *              Waiting for team lead to review and approve...
+ *        ⚠️ 注意这里**没有**用 "approved" 这个词——因为还没批。
+ *           措辞的准确度在这种地方很重要，写错了会误导用户。
+ *
+ *   ③ 普通会话，方案已批准（最常见）
+ *        显示：● User approved Claude's plan
+ *              Plan saved to: xxx · /plan to edit
+ *              <渲染方案全文的 Markdown>
+ *
+ * 设计意图（解释"为什么这么写"）：
+ *   · 用 ●（BLACK_CIRCLE）+ plan 模式专用色，和 EnterPlanModeTool 保持
+ *     同一套视觉语言——用户扫一眼颜色就知道这跟 plan mode 有关。
+ *   · 方案全文用 <Markdown> 组件渲染，而不是纯文本。
+ *     因为方案里通常有标题、列表、代码块，渲染成 Markdown 才好看。
+ *   · 路径提示里带一句 "· /plan to edit"（输入 /plan 可编辑），
+ *     是在**主动告诉用户还有这个能力**——否则用户以为方案定了就不能改。
+ *
+ * 入参：
+ *   output  ExitPlanModeV2Tool.call() 的输出（Output 类型），本函数的唯一数据源
+ * 返回值：一棵 Ink 组件树
+ */
 export function renderToolResultMessage(output: Output, _progressMessagesForMessage: ProgressMessage<ToolProgressData>[], {
   theme: _theme
 }: {
@@ -28,6 +160,7 @@ export function renderToolResultMessage(output: Output, _progressMessagesForMess
   const awaitingLeaderApproval = output.awaitingLeaderApproval;
 
   // Simplified message for empty plans
+  // 【中文补注】分支 ①：模型压根没写方案，只显示一行，不放 <Markdown>
   if (isEmpty) {
     return <Box flexDirection="column" marginTop={1}>
         <Box flexDirection="row">
@@ -38,6 +171,8 @@ export function renderToolResultMessage(output: Output, _progressMessagesForMess
   }
 
   // When awaiting leader approval, show a different message
+  // 【中文补注】分支 ②：子 Agent 的方案已投递给 team-lead，正在等批示。
+  // ⚠️ 这里刻意不写 "approved"——因为还没批，写错了会误导用户。
   if (awaitingLeaderApproval) {
     return <Box flexDirection="column" marginTop={1}>
         <Box flexDirection="row">
@@ -65,6 +200,21 @@ export function renderToolResultMessage(output: Output, _progressMessagesForMess
       </MessageResponse>
     </Box>;
 }
+/**
+ * 用户在审批弹窗里点了"拒绝"之后显示什么。
+ *
+ * 这里调用了一个专门的组件 <RejectedPlanMessage>，把方案原文传进去。
+ *
+ * 为什么被拒了还要显示方案全文？
+ *   因为用户点拒绝往往是"方案大体对，但某几点要改"。
+ *   把方案显示出来（通常还带上用户填写的修改意见），
+ *   用户和模型才能在同一份文本上讨论"到底哪里要改"。
+ *   如果只显示一句"已拒绝"，模型下一轮就不知道自己被否在哪儿。
+ *
+ * 入参：
+ *   { plan }  解构出的方案文本。类型是 `plan?: string`——可能压根没传。
+ * 返回值：一棵 Ink 组件树
+ */
 export function renderToolUseRejectedMessage({
   plan
 }: {
@@ -74,6 +224,14 @@ export function renderToolUseRejectedMessage({
 }: {
   theme: ThemeName;
 }): React.ReactNode {
+  // ★ `??` 的**串联**用法：从左往右，取第一个不是 null/undefined 的值。
+  //   ① 优先用传进来的 plan（用户在弹窗里编辑过的版本）
+  //   ② 没传 → 去磁盘读计划文件（getPlan()）
+  //   ③ 磁盘也没有 → 兜底成 'No plan found'
+  //   ≈ Java 的 Optional.ofNullable(a).or(...).orElse(...)，但写法轻得多。
+  //   ⚠️ 注意这里用 `??` 而不是 `||`：如果 plan 是空串 ''，
+  //      `??` 会**保留**它（然后 RejectedPlanMessage 拿到空串），
+  //      而 `||` 会跳过它去读磁盘。这里的选择是"传入优先，哪怕是空的"。
   const planContent = plan ?? getPlan() ?? 'No plan found';
   return <Box flexDirection="column">
       <RejectedPlanMessage plan={planContent} />

@@ -1,5 +1,37 @@
+/**
+ * 【一句话定位】内置 agent「statusline-setup」的定义：帮用户配置 Claude Code 的
+ * statusLine（终端底部状态栏）设置。
+ *
+ * 【在架构中的位置】
+ *   上游：builtInAgents.ts（永远在名单里）。
+ *   下游：只用 Read 和 Edit 两个工具（读 shell 配置、改 settings.json）。
+ *   它是一个**很窄**的专用 agent：只干一件事，且需要知道 statusLine 命令收到的完整 JSON 结构，
+ *   所以那份结构说明整个写死在 system prompt 里（见 STATUSLINE_SYSTEM_PROMPT）。
+ *
+ * 【本文件包含什么】
+ *   - STATUSLINE_SYSTEM_PROMPT：超长的 system prompt，含 PS1 转义序列转换表、
+ *     statusLine 命令收到的 JSON 结构说明、若干 jq 用法示例。
+ *   - STATUSLINE_SETUP_AGENT：agent 定义对象。
+ *
+ * 【TS 语法速查】
+ *   - 本文件几乎只有一个巨大的模板字符串常量，语法点很少。
+ *   - 模板字符串里如果要出现反引号，必须写成 `\``（转义），本文件里多次出现。
+ *   - 模板字符串里的 `\n` `\u` 等是**字符串转义**（在生成的文件里是真正的转义序列文本），
+ *     因为这段文本是给模型看的示例，里面要原样保留 `\u` 这种 PS1 转义写法。
+ *   - `tools: ['Read', 'Edit']` 白名单：这个 agent 只需要读和改，给多了风险大。
+ *   - `model: 'sonnet'`：配置类任务需要一定推理能力，但不必用最强的。
+ *   - `color: 'orange'`：UI 里显示成橙色（见 agentColorManager.ts）。
+ */
 import type { BuiltInAgentDefinition } from '../loadAgentsDir.js'
 
+/**
+ * statusline agent 的 system prompt。内容分三块：
+ *   ① 怎么把用户的 shell PS1 转换成 statusLine 命令（含完整的转义序列表）
+ *   ② statusLine 命令从 stdin 收到的 JSON 结构（每个字段都注释了含义）
+ *   ③ 若干 jq 用法示例（取模型名、取目录、算上下文剩余百分比等）
+ * 最后一条要求很重要：结束时必须告诉父 Agent「以后改状态栏继续找我」，
+ * 否则主 Agent 下次可能自己动手改，配置风格就不一致了。
+ */
 const STATUSLINE_SYSTEM_PROMPT = `You are a status line setup agent for Claude Code. Your job is to create or update the statusLine command in the user's Claude Code settings.
 
 When asked to convert the user's shell PS1 configuration, follow these steps:
@@ -131,6 +163,7 @@ Guidelines:
   Also ensure that the user is informed that they can ask Claude to continue to make changes to the status line.
 `
 
+// agent 定义：工具白名单只有 Read 和 Edit
 export const STATUSLINE_SETUP_AGENT: BuiltInAgentDefinition = {
   agentType: 'statusline-setup',
   whenToUse:
@@ -138,7 +171,9 @@ export const STATUSLINE_SETUP_AGENT: BuiltInAgentDefinition = {
   tools: ['Read', 'Edit'],
   source: 'built-in',
   baseDir: 'built-in',
+// 用 sonnet：转换 PS1 需要一定推理，但不需要最强模型
   model: 'sonnet',
+// UI 里显示成橙色
   color: 'orange',
   getSystemPrompt: () => STATUSLINE_SYSTEM_PROMPT,
 }

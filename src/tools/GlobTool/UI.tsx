@@ -1,3 +1,48 @@
+/**
+ * 【一句话定位】
+ *   Glob 工具的“展示层”：把工具入参/出参渲染成终端里人类可读的一行文本或 React 节点（不参与任何业务逻辑）。
+ *
+ * 【在架构中的位置】
+ *   上游调用链：
+ *     src/tools/GlobTool/GlobTool.ts（工具本体）
+ *       → 工具渲染调度（src/Tool.ts 约定的 userFacingName / renderToolUseMessage / renderToolUseErrorMessage /
+ *         renderToolResultMessage / getToolUseSummary 五个钩子）
+ *       → 本文件导出的这几个函数
+ *   下游依赖：
+ *     - src/components/MessageResponse.js：把可能带 Markdown 的文本渲染成富文本
+ *     - src/ink.js 的 <Text>：终端 UI 组件（Ink = React 渲染到命令行）
+ *     - ../GrepTool/GrepTool.js：直接复用它的 renderToolResultMessage（见本文件第 53 行）
+ *   设计约定：工具目录里 UI.tsx 与 Tool.ts 分离，是为了让“计算”与“显示”解耦——
+ *   无头（headless）模式、测试、SDK 场景可以不加载任何 React 代码。
+ *
+ * 【本文件包含什么】
+ *   - userFacingName()：给终端用户看的工具名
+ *   - renderToolUseMessage()：工具被调用时显示的那一行动作描述
+ *   - renderToolUseErrorMessage()：工具报错时的友好展示
+ *   - renderToolResultMessage：直接复用 GrepTool 的实现（两个搜索工具展示形态一致）
+ *   - getToolUseSummary()：给历史/摘要用的极短字符串
+ *
+ * 【TS 语法速查】（只列本文件真实出现的写法）
+ *   - `.tsx` 后缀：TypeScript + JSX。JSX 就是在 JS 里直接写标签，如 <Text color="error">x</Text>，
+ *     编译后等价于 React.createElement(Text, {color:'error'}, 'x')。对照 Java：没有对应物，
+ *     可以类比 Android 的 XML 布局，但它是表达式、能嵌在代码里、受类型检查。
+ *   - `React.ReactNode`：可渲染节点的联合类型（字符串/数字/元素/数组/null...）。
+ *     对照 Java：类似 Object，但被限定成“组件树节点”，传错类型编译期报错。
+ *   - `Partial<{ pattern: string; path: string }>`：把所有字段变成可选（等价于 {pattern?: string; path?: string}）。
+ *     对照 Java：DTO 里所有字段都可为 null。为什么用 Partial：工具入参来自模型，
+ *     渲染时必须假设任何字段都可能缺失。
+ *   - 解构 + 类型标注写在**后面**：`function f({ pattern, path }: Partial<{...}>, { verbose }: { verbose: boolean })`。
+ *     注意 TS 的类型标注在变量名**后面**，和 Java 相反，最容易看串。
+ *   - `input?.pattern`：`?.` 可选链，input 为 null/undefined 时整体短路为 undefined，不抛 NPE。
+ *     对照 Java：input != null && input.getPattern()。
+ *   - `string | null`：联合类型。≈ Java 的 sealed interface 的简化版，表示“要么是 string 要么是 null”，
+ *     用它当返回值能强迫调用方处理 null 分支。
+ *   - `typeof result === 'string'`：TS 的**类型收窄**（narrowing）。在 if 里判断后，
+ *     result 在该分支内就被当成 string 用。≈ Java 的 `if (x instanceof String s)` 模式匹配（Java 17+）。
+ *   - `export const x = GrepTool.renderToolResultMessage`：把别处的值原样再导出一次（re-export），
+ *     两个工具共用同一份渲染逻辑，改一处即可。
+ *   - 模板字符串 `` `pattern: "${pattern}"` ``：反引号字符串，里面 ${} 直接插值。≈ Java 的 String.format 简写。
+ */
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs';
 import React from 'react';
 import { MessageResponse } from 'src/components/MessageResponse.js';
@@ -8,9 +53,12 @@ import { Text } from '../../ink.js';
 import { FILE_NOT_FOUND_CWD_NOTE, getDisplayPath } from '../../utils/file.js';
 import { truncate } from '../../utils/format.js';
 import { GrepTool } from '../GrepTool/GrepTool.js';
+// userFacingName：终端里显示的工具名。这里统一叫 "Search"，
+// 因为对终端用户来说 Glob（按名字找）和 Grep（按内容找）都是“搜索”，不必暴露内部工具名差异。
 export function userFacingName(): string {
   return 'Search';
 }
+// 渲染“工具被调用”这一行。入参用 Partial 包住：模型给的参数可能缺字段，渲染必须容错。
 export function renderToolUseMessage({
   pattern,
   path
@@ -22,21 +70,31 @@ export function renderToolUseMessage({
 }: {
   verbose: boolean;
 }): React.ReactNode {
+// pattern 都没有就没啥可展示的，返回 null（表示“不渲染这一行”），而不是渲染一个空串。
   if (!pattern) {
     return null;
   }
+// 没传 path 就只展示 pattern，避免显示成 "path: undefined" 这种噪音。
   if (!path) {
     return `pattern: "${pattern}"`;
   }
+// verbose=false 时用 getDisplayPath() 把长路径缩短（如 ~/proj/...），
+// 目的是终端一行放得下；verbose 模式下才展示完整路径供排查。
   return `pattern: "${pattern}", path: "${verbose ? path : getDisplayPath(path)}"`;
 }
+// 渲染“工具报错”。返回 React 节点而不是字符串，是为了能用 <Text color="error"> 上色、并支持 Markdown。
 export function renderToolUseErrorMessage(result: ToolResultBlockParam['content'], {
   verbose
 }: {
   verbose: boolean;
 }): React.ReactNode {
+// verbose 模式下直接把原始错误文本抛给用户看（排障用）；非 verbose 才走下面的“人类友好”文案。
+// 先判断 typeof === 'string'：错误内容可能是文本块数组，只有字符串才能 extractTag。
   if (!verbose && typeof result === 'string' && extractTag(result, 'tool_use_error')) {
     const errorMessage = extractTag(result, 'tool_use_error');
+// 专门识别“文件/目录不存在”这类错误（FILE_NOT_FOUND_CWD_NOTE 是它的标记串），
+// 换成一句人话 "File not found"。其它错误统一显示 "Error searching files"。
+// 为什么不全量显示原始错误：原始文本里往往夹着绝对路径与提示词，对终端用户是噪音。
     if (errorMessage?.includes(FILE_NOT_FOUND_CWD_NOTE)) {
       return <MessageResponse>
           <Text color="error">File not found</Text>
@@ -49,12 +107,19 @@ export function renderToolUseErrorMessage(result: ToolResultBlockParam['content'
   return <FallbackToolUseErrorMessage result={result} verbose={verbose} />;
 }
 
+// 英文原注释说的是：Glob 复用 Grep 的结果渲染。
+// 中文补充：两者的结果都是“一列文件路径”，展示形态天然一致，
+// 直接复用可避免两份几乎相同的 UI 代码各自漂移。
 // Note: GlobTool reuses GrepTool's renderToolResultMessage
 export const renderToolResultMessage = GrepTool.renderToolResultMessage;
+// getToolUseSummary：给历史记录/会话摘要用的极短描述（只保留 pattern 并截断）。
+// 为什么必须截断：摘要会累积进上下文，太长会挤占有效内容。
 export function getToolUseSummary(input: Partial<{
   pattern: string;
   path: string;
 }> | undefined): string | null {
+// `input?.pattern` 双保险：input 可能整个是 undefined，pattern 也可能是空串。
+// 返回 null 表示“没有可摘要的内容”，调用方据此决定不展示。
   if (!input?.pattern) {
     return null;
   }
