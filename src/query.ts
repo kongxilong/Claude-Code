@@ -425,15 +425,38 @@ export async function* query(
   | ToolUseSummaryMessage,
   Terminal
 > {
+  // // 记录本轮消耗过的命令 UUID
   const consumedCommandUuids: string[] = []
+  /**
+   * // 委托给 queryLoop 执行
+  // queryLoop 产出的所有事件会直接透传给 query 的调用者
+  // 当 queryLoop 正常 return 时，拿到 terminal
+  yield* 不是“yield 后面加个 *”，它是一个独立语法：委托给另一个迭代器/生成器。
+  它做了三件事：
+把 queryLoop 产生的所有值继续向外产出
+也就是说，调用 query() 的人，会依次收到 queryLoop 里 yield 出来的：
+StreamEvent
+RequestStartEvent
+Message
+TombstoneMessage
+ToolUseSummaryMessage
+等待 queryLoop 执行结束
+当 queryLoop 执行到 return terminal 时，这个 terminal 值会被赋给左边的 const terminal。
+继续执行后面的代码
+拿到 terminal 后，才进入下面的 for 循环，通知所有命令已完成。
+   */
   const terminal = yield* queryLoop(params, consumedCommandUuids)
   // Only reached if queryLoop returned normally. Skipped on throw (error
   // propagates through yield*) and on .return() (Return completion closes
   // both generators). This gives the same asymmetric started-without-completed
   // signal as print.ts's drainCommandQueue when the turn fails.
+  // 只有 queryLoop 正常结束才会走到这里
+  // 如果 queryLoop 抛异常，异常会直接透传出去
+  // 如果外部调用了 .return()，也不会走到这里
   for (const uuid of consumedCommandUuids) {
     notifyCommandLifecycle(uuid, 'completed')
   }
+   // 最终把 terminal 返回给调用者
   return terminal
 }
 
@@ -523,18 +546,48 @@ export async function* query(
  *    编译期开关（见文件头）。读代码时可以先把它当成 `true` 忽略掉，
  *    这样能少看掉一半的分支，主干逻辑会清晰很多。
  */
+/*
+async function：异步函数，返回一个 Promise，函数内部可以用 await。
+function*：生成器函数，返回一个 Generator，可以用 yield 逐步产出值。
+async function*：异步生成器函数，返回 AsyncGenerator。
+它既可以 await，也可以 yield。
+调用者可以用 for await ... of 循环消费它。
+// 定义一个异步生成器函数 queryLoop
+// 它会逐步产出 StreamEvent、RequestStartEvent、Message 等事件
+// 最终结束时返回一个 Terminal 值
+
+
+AsyncGenerator<T, TReturn, TNext> 表示一个异步生成器：
+T：每次 yield 产出的值类型；
+TReturn：最终 return 时的返回值类型；
+TNext：调用者通过 next(value) 传回的值类型。
+
+| 是 TypeScript 的 联合类型，类似 Java 里的：可以理解为：这个值可能是其中任意一种类型。
+
+AsyncGenerator 是什么
+这是 TypeScript 的 返回值类型注解。
+
+*/
 async function* queryLoop(
-  params: QueryParams,
-  consumedCommandUuids: string[],
+  params: QueryParams,  // 查询参数，包含系统提示词、上下文、最大轮数等
+  consumedCommandUuids: string[],  // 已经消费过的命令 UUID 列表，用于避免重复处理
 ): AsyncGenerator<
-  | StreamEvent
-  | RequestStartEvent
-  | Message
-  | TombstoneMessage
-  | ToolUseSummaryMessage,
-  Terminal
+  | StreamEvent  // 流式事件
+  | RequestStartEvent   // 请求开始事件
+  | Message  // 普通消息
+  | TombstoneMessage  //  tombstone 消息，通常表示某条消息已被移除或失效
+  | ToolUseSummaryMessage,  // 工具调用摘要消息
+  Terminal   // 循环结束时的返回值类型
 > {
   // Immutable params — never reassigned during the query loop.
+  /**
+   * const { systemPrompt, ... } = params 是什么
+这是 对象解构赋值。等价于
+const systemPrompt = params.systemPrompt;
+const userContext = params.userContext;
+const systemContext = params.systemContext;
+// ...
+   */
   const {
     systemPrompt,
     userContext,
@@ -545,6 +598,28 @@ async function* queryLoop(
     maxTurns,
     skipCacheWrite,
   } = params
+  /**
+   * ??意思是：
+如果 params.deps 是 null 或 undefined，就用 productionDeps()；
+否则就用 params.deps。
+和 || 不同：
+a || b：只要 a 是 falsy，比如 0、""、false、null、undefined，都会用 b；
+a ?? b：只有 a 是 null 或 undefined 时才用 b。
+
+undefined 表示“这个变量已经声明了，但还没有赋值”。
+TypeScript/JavaScript 里有两个空值：
+表格
+值	含义
+null	显式表示“没有值”
+undefined	变量未赋值、对象属性不存在、函数没返回值
+比如：
+ts
+
+编辑
+let x: string | undefined;
+// 此时 x 的值就是 undefined
+Java 里更接近 null，但 TS 把 null 和 undefined 分得更细。
+   */
   const deps = params.deps ?? productionDeps()
 
   // Mutable cross-iteration state. The loop body destructures this at the top
