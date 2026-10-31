@@ -589,14 +589,14 @@ const systemContext = params.systemContext;
 // ...
    */
   const {
-    systemPrompt,
-    userContext,
-    systemContext,
-    canUseTool,
-    fallbackModel,
-    querySource,
-    maxTurns,
-    skipCacheWrite,
+    systemPrompt,         // 系统提示词
+    userContext,          // 用户上下文
+    systemContext,        // 系统上下文
+    canUseTool,           // 是否允许使用工具
+    fallbackModel,        // 降级/兜底模型
+    querySource,          // 查询来源
+    maxTurns,             // 最大对话轮数
+    skipCacheWrite,       // 是否跳过缓存写入
   } = params
   /**
    * ??意思是：
@@ -620,23 +620,39 @@ let x: string | undefined;
 // 此时 x 的值就是 undefined
 Java 里更接近 null，但 TS 把 null 和 undefined 分得更细。
    */
+  // 如果 params.deps 存在，就使用它；否则使用默认的生产环境依赖
+  // ?? 是空值合并运算符，只在左侧为 null 或 undefined 时才取右侧值
   const deps = params.deps ?? productionDeps()
 
   // Mutable cross-iteration state. The loop body destructures this at the top
   // of each iteration so reads stay bare-name (`messages`, `toolUseContext`).
   // Continue sites write `state = { ... }` instead of 9 separate assignments.
+  // 可变状态对象，保存跨轮次的运行时状态
+  // 每次循环开始时会对它解构，这样可以直接使用 messages、toolUseContext 等变量名
+  // 更新状态时通常用 state = { ...state, xxx } 的方式整体替换，而不是逐个字段赋值
   let state: State = {
-    messages: params.messages,
-    toolUseContext: params.toolUseContext,
-    maxOutputTokensOverride: params.maxOutputTokensOverride,
-    autoCompactTracking: undefined,
-    stopHookActive: undefined,
-    maxOutputTokensRecoveryCount: 0,
-    hasAttemptedReactiveCompact: false,
-    turnCount: 1,
-    pendingToolUseSummary: undefined,
-    transition: undefined,
+    messages: params.messages,                        // 当前对话消息列表
+    toolUseContext: params.toolUseContext,            // 工具调用上下文
+    maxOutputTokensOverride: params.maxOutputTokensOverride, // 最大输出 token 覆盖值
+    autoCompactTracking: undefined,                   // 自动压缩追踪信息，初始为空
+    stopHookActive: undefined,                        // 停止钩子是否激活，初始为空
+    maxOutputTokensRecoveryCount: 0,                  // 最大输出 token 恢复重试次数
+    hasAttemptedReactiveCompact: false,               // 是否已经尝试过响应式压缩
+    turnCount: 1,                                     // 当前对话轮数，从 1 开始
+    pendingToolUseSummary: undefined,                 // 待发送的工具调用摘要，初始为空
+    transition: undefined,                            // 状态转移信息，初始为空
   }
+  /**
+   * feature('TOKEN_BUDGET') 是什么
+这通常是一个 特性开关 / Feature Flag 函数。
+ts
+const budgetTracker = feature('TOKEN_BUDGET') ? createBudgetTracker() : null
+意思是：
+如果 TOKEN_BUDGET 这个功能开关打开了，就创建 budgetTracker；
+否则 budgetTracker 为 null。
+   */
+  // 如果 TOKEN_BUDGET 特性开关开启，则创建 token 预算追踪器；否则为 null
+  // feature() 通常是一个 Feature Flag 工具，用于灰度发布或环境配置
   const budgetTracker = feature('TOKEN_BUDGET') ? createBudgetTracker() : null
 
   // task_budget.remaining tracking across compaction boundaries. Undefined
@@ -689,12 +705,17 @@ Java 里更接近 null，但 TS 把 null 和 undefined 分得更细。
     // nothing in prod). Turn-0 user-input discovery still blocks in
     // userInputAttachments — that's the one signal where there's no prior
     // work to hide under.
+    // 可选链调用：如果 skillPrefetch 是 null 或 undefined，就不再继续调用，直接返回 undefined
     const pendingSkillPrefetch = skillPrefetch?.startSkillDiscoveryPrefetch(
       null,
       messages,
       toolUseContext,
     )
 
+    /**
+     * 当前 async function* 函数执行到这里时，会向调用者发出一个事件，事件内容是：
+     { type: 'stream_request_start' }
+     */
     yield { type: 'stream_request_start' }
 
     queryCheckpoint('query_fn_entry')
@@ -718,6 +739,30 @@ Java 里更接近 null，但 TS 把 null 和 undefined 分得更细。
     const queryChainIdForAnalytics =
       queryTracking.chainId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
 
+    /**
+     * 这里的 ...toolUseContext 是 JavaScript/TypeScript 里的 对象展开语法。
+    toolUseContext = {
+      ...toolUseContext,
+      queryTracking,
+    }
+    它的意思是：创建一个新对象，先复制 toolUseContext 原有的所有属性，然后加上（或覆盖）queryTracking 这个属性。
+    等价于：
+    toolUseContext = Object.assign({}, toolUseContext, { queryTracking })
+    或者展开写：
+
+    toolUseContext = {
+      a: toolUseContext.a,
+      b: toolUseContext.b,
+      c: toolUseContext.c,
+      // ... 原有所有属性
+      queryTracking: queryTracking,   // 新增或覆盖
+    }
+    为什么要这么写
+    这是一种 不可变更新 的写法。它不会直接修改原对象，而是生成一个新对象再赋值回去。好处是：
+    如果有其他地方还持有旧对象的引用，不会被意外影响；
+    方便做状态快照、回滚、调试；
+    在 React、Redux、生成器状态机等场景里非常常见。
+     */
     toolUseContext = {
       ...toolUseContext,
       queryTracking,
@@ -727,6 +772,18 @@ Java 里更接近 null，但 TS 把 null 和 undefined 分得更细。
     // 先取最近的 compact 边界之后的全部消息作为本轮的上下文输入。
     // 语法点：[...arr] 是数组展开复制，≈ Java 的 new ArrayList<>(arr)，
     //         目的是不污染原数组（保持不可变，避免别处拿到意外修改）。
+    /**
+     * getMessagesAfterCompactBoundary 就是负责这个裁剪逻辑：它会从 messages 里找到压缩边界，然后返回边界之后的部分。
+    后面的 [...] 是为了避免直接复用原数组引用。如果后面代码对 messagesForQuery 做 push、splice、filter 等操作，不会影响原始 messages。
+    Java 里近似写法
+    List<Message> messagesForQuery = new ArrayList<>(
+        getMessagesAfterCompactBoundary(messages)
+    );
+    或者：
+    List<Message> messagesForQuery = List.copyOf(
+        getMessagesAfterCompactBoundary(messages)
+    );
+     */
     let messagesForQuery = [...getMessagesAfterCompactBoundary(messages)]
 
     let tracking = autoCompactTracking
@@ -738,6 +795,30 @@ Java 里更接近 null，但 TS 把 null 和 undefined 分得更细。
     // Persist only for querySources that read records back on resume: agentId
     // routes to sidechain file (AgentTool resume) or session file (/resume).
     // Ephemeral runForkedAgent callers (agent_summary etc.) don't persist.
+    /**
+     * new Set(
+      toolUseContext.options.tools
+        .filter(t => !Number.isFinite(t.maxResultSizeChars))
+        .map(t => t.name),
+    )
+    就是把这些“不限制大小”的工具名收集起来，后面传给 applyToolResultBudget，表示这些工具跳过预算裁剪。
+
+    await applyToolResultBudget(...)
+    applyToolResultBudget 是一个异步函数，用来对消息里的工具返回结果做“预算裁剪”。
+    messagesForQuery = await applyToolResultBudget(...)
+    它做的事情通常是：
+    扫描消息里所有工具返回内容；
+    如果某个工具结果太大，就把它替换成短预览；
+    完整内容可能写入本地文件；
+    返回替换后的消息列表。
+    await 表示要等这个函数执行完，拿到处理后的 messagesForQuery，再继续往下走。
+    整体意思是：
+    在把消息发给模型之前，先对工具返回结果做大小预算控制；但那些 maxResultSizeChars 为 Infinity 的工具不参与这次裁剪，因为它们有自己的独立限制。
+    简单类比：
+    Number.isFinite：判断某个工具是否有“大小上限”；
+    applyToolResultBudget：给没有独立上限的工具结果做统一瘦身；
+    await：等瘦身完成，再拿结果继续往下走。
+     */
     const persistReplacements =
       querySource.startsWith('agent:') ||
       querySource.startsWith('repl_main_thread')
@@ -765,6 +846,14 @@ Java 里更接近 null，但 TS 把 null 和 undefined 分得更细。
     let snipTokensFreed = 0
     if (feature('HISTORY_SNIP')) {
       queryCheckpoint('query_snip_start')
+      /**
+       * 这里的 ! 是 TypeScript 的 非空断言操作符。
+      它告诉编译器：“我确定 snipModule 不会是 null 或 undefined，你别报错了。”
+      和 ?. 的区别
+      snipModule.snipCompactIfNeeded(...)	如果 snipModule 可能为 null，TS 会报错
+      snipModule?.snipCompactIfNeeded(...)	如果为 null，直接返回 undefined，不会调用
+      snipModule!.snipCompactIfNeeded(...)	强制告诉 TS “它不是 null”，如果运行时真为 null 会抛异常
+       */
       const snipResult = snipModule!.snipCompactIfNeeded(messagesForQuery)
       messagesForQuery = snipResult.messages
       snipTokensFreed = snipResult.tokensFreed
@@ -899,8 +988,26 @@ Java 里更接近 null，但 TS 把 null 和 undefined 分得更细。
       // Continue on with the current query call using the post compact messages
       messagesForQuery = postCompactMessages
     } else if (consecutiveFailures !== undefined) {
+      /**
+       * !== 严格不等于
+      consecutiveFailures !== undefined
+      意思是：consecutiveFailures 的值不是 undefined。
+      !== 是严格不等于，既比较值也比较类型。和 != 的区别：
+      表格
+      表达式	结果	说明
+      null != undefined	true? 不，是 false	!= 会做类型转换
+      null !== undefined	true	!== 不做类型转换
+      0 != '0'	false	!= 会转换类型
+      0 !== '0'	true	!== 严格比较
+      这里用 !== undefined 而不是 != null，通常是为了精确判断是否传了这个值，而不是判断真假。因为 0、''、false 都是 falsy，但它们是有效值。
+       */
       // Autocompact failed — propagate failure count so the circuit breaker
       // can stop retrying on the next iteration.
+      /**
+       * ?? 空值合并运算符
+      tracking ?? { compacted: false, turnId: '', turnCounter: 0 }
+      意思是：如果 tracking 是 null 或 undefined，就用后面的默认对象；否则用 tracking 本身。
+       */
       tracking = {
         ...(tracking ?? { compacted: false, turnId: '', turnCounter: 0 }),
         consecutiveFailures,
