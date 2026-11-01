@@ -1763,6 +1763,9 @@ const budgetTracker = feature('TOKEN_BUDGET') ? createBudgetTracker() : null
       // real response — hooks evaluating it create a death spiral:
       // error → hook blocking → retry → error → …
       if (lastMessage?.isApiErrorMessage) {
+        /**
+         * 这里的 void 是 JavaScript/TypeScript 的 void 运算符，它的作用是：执行一个表达式，然后丢弃其返回值，始终返回 undefined。
+         */
         void executeStopFailureHooks(lastMessage, toolUseContext)
         return { reason: 'completed' }
       }
@@ -1891,17 +1894,25 @@ const budgetTracker = feature('TOKEN_BUDGET') ? createBudgetTracker() : null
 
     // 逐个等待工具执行结果。每拿到一个就立刻 yield 出去给 UI 渲染，
     // 用户因此能看到工具一个接一个完成，而不是全部跑完才一起显示。
+    // 遍历工具执行产生的流式更新事件（toolUpdates 是一个异步迭代器）
     for await (const update of toolUpdates) {
+      // 如果这次更新包含消息内容（即模型产生了输出）
       if (update.message) {
+        // 将消息产出给调用者（流式输出，让前端能实时看到内容）
         yield update.message
 
+        // 检查是否是"hook 停止续写"类型的附件
+        // 这种附件表示上游钩子（如 skill 钩子）决定阻止继续执行
         if (
           update.message.type === 'attachment' &&
           update.message.attachment.type === 'hook_stopped_continuation'
         ) {
+          // 标记：后续应阻止继续执行循环
           shouldPreventContinuation = true
         }
 
+        // 将工具结果规范化为 API 格式，并只保留 type === 'user' 的消息
+        // 这些 user 消息中包含 tool_result 块，需要收集起来传给下一轮对话
         toolResults.push(
           ...normalizeMessagesForAPI(
             [update.message],
@@ -1909,44 +1920,68 @@ const budgetTracker = feature('TOKEN_BUDGET') ? createBudgetTracker() : null
           ).filter(_ => _.type === 'user'),
         )
       }
+
+      // 如果这次更新携带了新的上下文（如工具修改了配置、更新了 tracking 信息等）
       if (update.newContext) {
+        // 不可变更新：在 update.newContext 的基础上追加 queryTracking 字段
+        // ...update.newContext 展开原有属性，queryTracking 追加/覆盖
         updatedToolUseContext = {
           ...update.newContext,
           queryTracking,
         }
       }
     }
+
+    // 打检查点：标记工具执行阶段结束，用于性能追踪和调试
     queryCheckpoint('query_tool_execution_end')
 
     // Generate tool use summary after tool batch completes — passed to next recursive call
+    // 工具批次执行完毕后，生成工具使用摘要 —— 这个摘要会传递到下一轮递归调用中
+    // 声明一个可能为 undefined 的 Promise，用于异步生成摘要
     let nextPendingToolUseSummary:
       | Promise<ToolUseSummaryMessage | null>
       | undefined
+
+    // 决定是否要生成工具使用摘要，需要同时满足以下所有条件：
     if (
+      // 1. 功能开关已开启（编译期/配置期控制）
       config.gates.emitToolUseSummaries &&
+      // 2. 本轮确实有工具被调用（toolUseBlocks 不为空）
       toolUseBlocks.length > 0 &&
+      // 3. 请求未被取消（abortController 未被 abort）
       !toolUseContext.abortController.signal.aborted &&
-      !toolUseContext.agentId // subagents don't surface in mobile UI — skip the Haiku call
+      // 4. 不是子 Agent 的请求（subagent 不在 mobile UI 中展示，跳过 Haiku 调用以节省资源）
+      !toolUseContext.agentId
     ) {
-      // Extract the last assistant text block for context
+      // === 步骤1：提取助手最后一条文本消息作为上下文 ===
+
+      // 从 assistantMessages 中取最后一条助手消息（at(-1) 是数组最后一个元素）
       const lastAssistantMessage = assistantMessages.at(-1)
       let lastAssistantText: string | undefined
+
       if (lastAssistantMessage) {
+        // 从消息内容中筛选出 type === 'text' 的文本块
         const textBlocks = lastAssistantMessage.message.content.filter(
           block => block.type === 'text',
         )
+        // 如果有文本块，取最后一个文本块的内容
         if (textBlocks.length > 0) {
           const lastTextBlock = textBlocks.at(-1)
+          // 类型守卫：确保这个文本块有 text 属性
           if (lastTextBlock && 'text' in lastTextBlock) {
             lastAssistantText = lastTextBlock.text
           }
         }
       }
 
-      // Collect tool info for summary generation
+      // === 步骤2：收集每个工具调用的详细信息，用于生成摘要 ===
+
+      // 提取所有工具调用块的 ID 列表
       const toolUseIds = toolUseBlocks.map(block => block.id)
+
+      // 为每个工具调用块匹配对应的执行结果，组装摘要所需的数据
       const toolInfoForSummary = toolUseBlocks.map(block => {
-        // Find the corresponding tool result
+        // 在 toolResults 中查找与该工具调用 ID 匹配的结果
         const toolResult = toolResults.find(
           result =>
             result.type === 'user' &&
@@ -1957,37 +1992,47 @@ const budgetTracker = feature('TOKEN_BUDGET') ? createBudgetTracker() : null
                 content.tool_use_id === block.id,
             ),
         )
+
+        // 安全地提取工具结果中的 content 字段
         const resultContent =
           toolResult?.type === 'user' &&
           Array.isArray(toolResult.message.content)
             ? toolResult.message.content.find(
+                // 类型谓词：缩小类型范围，告诉 TS 这个元素一定是 ToolResultBlockParam
                 (c): c is ToolResultBlockParam =>
                   c.type === 'tool_result' && c.tool_use_id === block.id,
               )
             : undefined
+
+        // 组装工具信息对象
         return {
-          name: block.name,
-          input: block.input,
+          name: block.name,           // 工具名称
+          input: block.input,         // 工具输入参数
           output:
             resultContent && 'content' in resultContent
-              ? resultContent.content
-              : null,
+              ? resultContent.content  // 工具输出内容（如果有）
+              : null,                  // 否则为 null
         }
       })
 
-      // Fire off summary generation without blocking the next API call
+      // === 步骤3：异步触发摘要生成，不阻塞后续的 API 调用 ===
+
+      // generateToolUseSummary 是一个异步函数，可能调用 Haiku 模型来生成摘要
+      // 用 .then().catch() 链处理，即使出错也返回 null 而不抛异常
       nextPendingToolUseSummary = generateToolUseSummary({
-        tools: toolInfoForSummary,
-        signal: toolUseContext.abortController.signal,
-        isNonInteractiveSession: toolUseContext.options.isNonInteractiveSession,
-        lastAssistantText,
+        tools: toolInfoForSummary,        // 工具调用和结果信息
+        signal: toolUseContext.abortController.signal,  // 取消信号
+        isNonInteractiveSession: toolUseContext.options.isNonInteractiveSession,  // 是否非交互会话
+        lastAssistantText,                // 助手最后的文本（作为摘要的上下文）
       })
+        // 摘要生成成功后，包装成标准消息格式
         .then(summary => {
           if (summary) {
             return createToolUseSummaryMessage(summary, toolUseIds)
           }
           return null
         })
+        // 出错时静默处理，返回 null 不影响主流程
         .catch(() => null)
     }
 
